@@ -54,10 +54,50 @@ export function cleanGeminiEnv(parent = process.env) {
 // per-call with --model, or globally via GEMINI_PLUGIN_MODEL env var.
 export const DEFAULT_MODEL = "gemini-3.1-pro-preview";
 
+// Fallback chain: tried in order if the default is unavailable for the
+// caller's account (rollout, region, quota). A previewing model in tier 1
+// may not be enabled for every account; tier 3 is the broadly-available
+// floor. Used by setup-time probing only, not by per-call invocations
+// (those still use the user's selected model and surface the error).
+export const MODEL_FALLBACK_CHAIN = [
+  "gemini-3.1-pro-preview",
+  "gemini-3-pro-preview",
+  "gemini-2.5-pro"
+];
+
+// Minimum @google/gemini-cli version we have actually validated. Older
+// versions may not support `--approval-mode plan` or our flag set.
+export const MIN_GEMINI_VERSION = "0.30.0";
+
 export function effectiveModel(callerModel) {
   if (callerModel) return callerModel;
   if (process.env.GEMINI_PLUGIN_MODEL) return process.env.GEMINI_PLUGIN_MODEL;
   return DEFAULT_MODEL;
+}
+
+// Compare two semver-like strings ("0.39.1" vs "0.30.0"). Returns -1 / 0 / 1.
+// Tolerates trailing labels ("0.39.1-rc.2" → numeric core only).
+export function compareVersions(a, b) {
+  const parse = s => String(s || "0.0.0").match(/(\d+)\.(\d+)\.(\d+)/) || [];
+  const pa = parse(a), pb = parse(b);
+  for (let i = 1; i <= 3; i++) {
+    const ai = parseInt(pa[i] || "0", 10);
+    const bi = parseInt(pb[i] || "0", 10);
+    if (ai < bi) return -1;
+    if (ai > bi) return 1;
+  }
+  return 0;
+}
+
+export function checkMinVersion(currentRaw) {
+  const current = (currentRaw || "").trim();
+  const m = current.match(/(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return { ok: false, reason: "could not parse version", current };
+  const cleaned = m[0];
+  if (compareVersions(cleaned, MIN_GEMINI_VERSION) < 0) {
+    return { ok: false, reason: `installed ${cleaned} < required ${MIN_GEMINI_VERSION}`, current: cleaned };
+  }
+  return { ok: true, current: cleaned };
 }
 
 export function which(cmd) {
@@ -76,6 +116,7 @@ export function classifyAuthBlob(blob) {
   }
   if (/quota|RESOURCE_EXHAUSTED/i.test(blob)) return "quota exhausted";
   if (/permission|forbidden|403/i.test(blob)) return "auth rejected (403)";
+  if (/ModelNotFoundError|model.*not.*found|model.*not.*available|invalid.*model/i.test(blob)) return "model unavailable";
   return null;
 }
 
@@ -86,7 +127,7 @@ export function detectAuthSource() {
   return "settings.json (oauth)";
 }
 
-export function authProbe() {
+export function authProbe(model) {
   const r = spawnSync(
     "gemini",
     [
@@ -94,19 +135,37 @@ export function authProbe() {
       "--skip-trust",
       "--approval-mode", "plan",
       "-o", "text",
-      "--model", effectiveModel()
+      "--model", model || effectiveModel()
     ],
     { encoding: "utf8", timeout: AUTH_PROBE_TIMEOUT_MS, env: cleanGeminiEnv() }
   );
   const blob = (r.stdout || "") + "\n" + (r.stderr || "");
   if (r.status === 0 && /\bOK\b/i.test(r.stdout || "")) {
-    return { ok: true, detail: "responsive" };
+    return { ok: true, detail: "responsive", model: model || effectiveModel() };
   }
   if (r.error?.code === "ETIMEDOUT") {
-    return { ok: false, detail: "auth probe timed out" };
+    return { ok: false, detail: "auth probe timed out", model: model || effectiveModel() };
   }
   const why = classifyAuthBlob(blob);
-  return { ok: false, detail: why || "probe failed", raw: blob.slice(0, 400) };
+  return { ok: false, detail: why || "probe failed", raw: blob.slice(0, 400), model: model || effectiveModel() };
+}
+
+// Try the configured model; on "model unavailable", walk the fallback chain.
+// Returns { ok, model, detail, fallbackUsed }. Only considers fallback when
+// the user has not pinned a specific model via --model or GEMINI_PLUGIN_MODEL —
+// honoring an explicit override is a stronger signal than the chain.
+export function probeWithFallback() {
+  const userPinned = !!process.env.GEMINI_PLUGIN_MODEL;
+  const first = authProbe();
+  if (first.ok) return { ...first, fallbackUsed: null };
+  if (userPinned) return { ...first, fallbackUsed: null };
+  if (first.detail !== "model unavailable") return { ...first, fallbackUsed: null };
+  for (const candidate of MODEL_FALLBACK_CHAIN) {
+    if (candidate === first.model) continue;
+    const r = authProbe(candidate);
+    if (r.ok) return { ...r, fallbackUsed: candidate };
+  }
+  return { ...first, fallbackUsed: null };
 }
 
 export function geminiBaseArgs({ readOnly = true, model, jsonOutput = false } = {}) {

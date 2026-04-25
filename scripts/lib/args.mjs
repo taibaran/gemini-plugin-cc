@@ -75,5 +75,5 @@ export const COMMON_BOOL_FLAGS = new Set([
 ]);
 
 export const COMMON_VALUE_FLAGS = new Set([
-  "base", "scope", "model"
+  "base", "scope", "model", "older-than"
 ]);

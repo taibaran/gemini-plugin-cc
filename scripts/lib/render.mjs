@@ -62,9 +62,15 @@ export class TerminalSanitizer {
   }
 
   flush() {
-    const out = sanitize(this.pending);
+    // The pending buffer holds an unfinished escape sequence — by definition
+    // we held it back because we could not yet decide whether to strip it.
+    // If it never completes (end-of-stream), the safe thing is to drop the
+    // whole tail. Sanitizing it would strip the ESC byte but leak the bytes
+    // after (e.g. "[3" from an incomplete CSI), which can still be visible
+    // junk and, in pathological cases, the start of a sequence the next
+    // terminal interprets after a state reset.
     this.pending = "";
-    return out;
+    return "";
   }
 }
 

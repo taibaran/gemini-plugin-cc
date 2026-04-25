@@ -12,14 +12,14 @@ import { parseArgs, COMMON_BOOL_FLAGS, COMMON_VALUE_FLAGS } from "./lib/args.mjs
 import {
   ensureDir, jobsDir, newJobId,
   writeJobMeta, readJobMeta, listJobs, pruneJobs,
-  readConfig, setReviewGate
+  readConfig, setReviewGate, safeJobLogPath, purgeJobs
 } from "./lib/state.mjs";
 import { isAlive, terminateProcessTree } from "./lib/process.mjs";
 import { captureDiff } from "./lib/git.mjs";
 import {
-  which, geminiVersion, authProbe, classifyAuthBlob,
+  which, geminiVersion, classifyAuthBlob,
   detectAuthSource, geminiBaseArgs, effectiveModel, DEFAULT_MODEL,
-  cleanGeminiEnv
+  cleanGeminiEnv, probeWithFallback, checkMinVersion, MIN_GEMINI_VERSION
 } from "./lib/gemini.mjs";
 import { buildReviewPrompt } from "./lib/prompts.mjs";
 import { renderJobTable, renderJobDetails, fmtTime, TerminalSanitizer, sanitizeForTerminal } from "./lib/render.mjs";
@@ -61,24 +61,46 @@ function cmdSetup({ flags }) {
   const gemBin = which("gemini");
   if (gemBin) {
     result.gemini.available = true;
-    result.gemini.detail = geminiVersion() || "installed";
+    const rawVer = geminiVersion();
+    result.gemini.detail = rawVer || "installed";
+    const verCheck = checkMinVersion(rawVer);
+    result.gemini.version_ok = verCheck.ok;
+    if (!verCheck.ok) {
+      result.gemini.version_warning = `${verCheck.reason}`;
+      result.nextSteps.push(
+        `Upgrade Gemini CLI: \`npm install -g @google/gemini-cli@latest\`. Plugin requires >= ${MIN_GEMINI_VERSION}; detected ${verCheck.current || "unknown"}.`
+      );
+    }
   } else {
     result.gemini.detail = "not installed";
     result.nextSteps.push("Install Gemini CLI: `npm install -g @google/gemini-cli`");
   }
 
   if (gemBin) {
-    const probe = authProbe();
+    const probe = probeWithFallback();
     result.auth.available = probe.ok;
     result.auth.detail = probe.detail;
     // Only claim a specific source when auth actually works. Otherwise
     // detectAuthSource() returns "settings.json (oauth)" as a fallback,
     // which falsely implies oauth is configured when nothing is.
     result.auth.source = probe.ok ? detectAuthSource() : null;
-    if (!probe.ok) {
-      result.nextSteps.push(
-        "Authenticate Gemini. Either:\n  • Run `!gemini` once and complete the Google OAuth flow, OR\n  • Set GEMINI_API_KEY (free key from https://aistudio.google.com/app/apikey)."
+    if (probe.fallbackUsed) {
+      result.model.active = probe.fallbackUsed;
+      result.model.fallbackUsed = probe.fallbackUsed;
+      result.actionsTaken.push(
+        `Default model ${result.model.default} unavailable; falling back to ${probe.fallbackUsed} for this session. Set GEMINI_PLUGIN_MODEL to pin a different model.`
       );
+    }
+    if (!probe.ok) {
+      if (probe.detail === "model unavailable") {
+        result.nextSteps.push(
+          `No fallback-chain model is available for this account. Tried: ${[result.model.default, ...["gemini-3-pro-preview","gemini-2.5-pro"].filter(m => m !== result.model.default)].join(", ")}. Override with --model or GEMINI_PLUGIN_MODEL.`
+        );
+      } else {
+        result.nextSteps.push(
+          "Authenticate Gemini. Either:\n  • Run `!gemini` once and complete the Google OAuth flow, OR\n  • Set GEMINI_API_KEY (free key from https://aistudio.google.com/app/apikey)."
+        );
+      }
     }
   }
 
@@ -354,6 +376,25 @@ async function cmdTask({ flags, positional }) {
   }
 
   const isWrite = !!flags.write && !flags["read-only"];
+  if (isWrite && process.env.GEMINI_PLUGIN_ALLOW_WRITE !== "1") {
+    // Hardening: --write puts Gemini in --approval-mode yolo, which means it
+    // can modify files in this workspace without further confirmation. The
+    // env-var gate forces the user to make an explicit, durable decision
+    // before granting that authority. Defense-in-depth — also surfaces the
+    // risk in the error message rather than silently letting yolo through.
+    console.error("--write refused: GEMINI_PLUGIN_ALLOW_WRITE is not set to 1.");
+    console.error("");
+    console.error("--write puts Gemini in approval-mode=yolo, which lets it modify files");
+    console.error("in this workspace without per-action confirmation. Only enable in a");
+    console.error("workspace where you already trust running an unattended agent.");
+    console.error("");
+    console.error("To enable for this session:    export GEMINI_PLUGIN_ALLOW_WRITE=1");
+    console.error("To enable persistently:        add it to ~/.claude/settings.json env.");
+    process.exit(2);
+  }
+  if (isWrite) {
+    process.stderr.write("[gemini-plugin] WRITE MODE ACTIVE — Gemini may modify files in this workspace.\n");
+  }
   const args = ["-p", taskText, ...geminiBaseArgs({ readOnly: !isWrite, model: flags.model })];
   const meta = buildJobMeta({
     kind: "task",
@@ -402,18 +443,6 @@ function cmdStatus({ flags, positional }) {
 }
 
 // ---------- subcommand: result ----------
-
-// Confine log-file reads to the jobs directory. Job metadata is JSON we wrote
-// ourselves, but the file can be tampered with on disk by anything that has
-// write access to ${CLAUDE_PLUGIN_DATA}. Without confinement, a manipulated
-// stdout_path could make /gemini:result read any user-readable file.
-function safeJobLogPath(p) {
-  if (typeof p !== "string" || !p) return null;
-  const dir = path.resolve(jobsDir());
-  const resolved = path.resolve(p);
-  if (path.dirname(resolved) !== dir) return null;
-  return resolved;
-}
 
 function cmdResult({ positional }) {
   const target = positional[0];
@@ -479,6 +508,40 @@ async function killJob(meta) {
   await terminateProcessTree(meta.pid);
 }
 
+// ---------- subcommand: purge ----------
+
+function parseDuration(s) {
+  // Accept "30d", "12h", "45m", "60s", or a plain number-of-ms.
+  if (typeof s !== "string") return null;
+  const m = s.match(/^(\d+)\s*(s|m|h|d)?$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n)) return null;
+  const unit = (m[2] || "ms").toLowerCase();
+  const mult = unit === "s" ? 1000
+    : unit === "m" ? 60_000
+    : unit === "h" ? 3_600_000
+    : unit === "d" ? 86_400_000
+    : 1;
+  return n * mult;
+}
+
+function cmdPurge({ flags }) {
+  const ageRaw = flags["older-than"] || null;
+  const maxAgeMs = ageRaw ? parseDuration(ageRaw) : null;
+  if (ageRaw && !maxAgeMs) {
+    console.error(`Invalid --older-than value: ${ageRaw}. Use forms like 30d, 12h, 45m, 60s.`);
+    process.exit(2);
+  }
+  const purged = purgeJobs({ maxAgeMs });
+  if (maxAgeMs) {
+    console.log(`Purged ${purged} job(s) older than ${ageRaw}.`);
+  } else {
+    console.log(`Purged ${purged} job(s).`);
+  }
+  process.exit(0);
+}
+
 async function cmdCancel({ positional }) {
   const target = positional[0];
   if (!target) {
@@ -507,7 +570,7 @@ async function cmdCancel({ positional }) {
 async function main() {
   const [, , sub, ...rest] = process.argv;
   if (!sub) {
-    console.error("Usage: companion.mjs <setup|ask|review|adversarial-review|task|status|result|cancel> [args...]");
+    console.error("Usage: companion.mjs <setup|ask|review|adversarial-review|task|status|result|cancel|purge> [args...]");
     process.exit(2);
   }
   let args;
@@ -526,9 +589,10 @@ async function main() {
     case "status": return cmdStatus(args);
     case "result": return cmdResult(args);
     case "cancel": return await cmdCancel(args);
+    case "purge": return cmdPurge(args);
     default:
       console.error(`Unknown subcommand: ${sub}`);
-      console.error("Usage: companion.mjs <setup|ask|review|adversarial-review|task|status|result|cancel> [args...]");
+      console.error("Usage: companion.mjs <setup|ask|review|adversarial-review|task|status|result|cancel|purge> [args...]");
       process.exit(2);
   }
 }

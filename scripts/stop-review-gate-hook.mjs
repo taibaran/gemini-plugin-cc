@@ -23,6 +23,13 @@ import { buildStopGatePrompt } from "./lib/prompts.mjs";
 
 const HOOK_TIMEOUT_MS = 12 * 60 * 1000;
 
+// Strict mode: instead of fail-open on infrastructure errors (gemini missing,
+// auth failed, timeout, parse error), block the stop with an explanatory
+// reason. Off by default — fail-open is the right UX so a broken Gemini
+// install does not strand the user mid-session. Opt in by setting
+// GEMINI_REVIEW_GATE_STRICT=1 in the env (e.g. ~/.claude/settings.json env).
+const STRICT = process.env.GEMINI_REVIEW_GATE_STRICT === "1";
+
 function emitAllow(reason = "") {
   if (reason) {
     process.stdout.write(JSON.stringify({ systemMessage: `gemini-plugin: ${reason}` }) + "\n");
@@ -34,6 +41,14 @@ function emitBlock(reason) {
   // Stop-hook block contract: { decision: "block", reason: "<text>" }.
   process.stdout.write(JSON.stringify({ decision: "block", reason }) + "\n");
   process.exit(0);
+}
+
+// In strict mode, infrastructure failures should block stop with a clear reason
+// instead of allowing through. Used by every fallback path that previously
+// called emitAllow on a non-no-diff failure.
+function emitInfraFailure(reason) {
+  if (STRICT) emitBlock(`Gemini review gate (strict): ${reason}`);
+  else emitAllow(reason);
 }
 
 // Find the end-index of the first balanced JSON object starting at `start`,
@@ -121,7 +136,7 @@ function main() {
     emitAllow();
   }
   if (!which("gemini")) {
-    emitAllow("gemini not installed — review gate skipped");
+    emitInfraFailure("gemini not installed — review gate skipped");
   }
 
   const claudeResponse = extractClaudeResponse(hookInput);
@@ -170,14 +185,14 @@ function main() {
   proc.on("close", code => {
     clearTimeout(timer);
     if (timedOut) {
-      emitAllow("review gate timed out — allowed");
+      emitInfraFailure("review gate timed out");
     }
     const why = classifyAuthBlob(outBuf + "\n" + errBuf);
     if (why) {
-      emitAllow(`review gate skipped (${why})`);
+      emitInfraFailure(`review gate skipped (${why})`);
     }
     if (code !== 0) {
-      emitAllow(`review gate skipped (gemini exit ${code})`);
+      emitInfraFailure(`review gate skipped (gemini exit ${code})`);
     }
     // Parse the verdict as strict JSON, not as a free-form first line. This
     // closes a prompt-injection bypass where a malicious diff could ask
@@ -185,7 +200,7 @@ function main() {
     // to produce a structured verdict JSON; anything else is "unparseable".
     const verdict = parseVerdict(outBuf);
     if (!verdict) {
-      emitAllow(`review gate verdict unparseable — allowed (raw: ${(outBuf || "").trim().slice(0, 80)})`);
+      emitInfraFailure(`review gate verdict unparseable (raw: ${(outBuf || "").trim().slice(0, 80)})`);
     }
     if (verdict.decision === "block") {
       emitBlock(`Gemini review gate blocked stop: ${verdict.reason || "(no reason supplied)"}`);
@@ -195,7 +210,7 @@ function main() {
 
   proc.on("error", err => {
     clearTimeout(timer);
-    emitAllow(`review gate error: ${err.message}`);
+    emitInfraFailure(`review gate error: ${err.message}`);
   });
 }
 

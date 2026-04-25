@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Syntax check all .mjs files
+        run: |
+          set -e
+          find scripts tests -name '*.mjs' -print0 | xargs -0 -n1 node --check
+
+      - name: Run unit tests
+        run: npm test
+
+  smoke:
+    name: Smoke test (companion dispatcher)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Bad subcommand prints usage and exits 2
+        run: |
+          set +e
+          node scripts/companion.mjs nonexistent
+          if [ "$?" -ne 2 ]; then echo "Expected exit 2"; exit 1; fi
+
+      - name: status returns successfully on empty workspace
+        run: node scripts/companion.mjs status
+
+      - name: Argument parser does not crash on edge inputs
+        run: |
+          set -e
+          node scripts/companion.mjs status --all
+          node scripts/companion.mjs purge --older-than 30d || true
+
+      - name: Write mode is refused without GEMINI_PLUGIN_ALLOW_WRITE
+        run: |
+          set +e
+          node scripts/companion.mjs task --write "test" 2>&1 | tee out.txt
+          rc=$?
+          if [ "$rc" -ne 2 ]; then echo "Expected exit 2 from write refusal"; exit 1; fi
+          grep -q 'GEMINI_PLUGIN_ALLOW_WRITE' out.txt || (echo "Refusal message missing"; exit 1)

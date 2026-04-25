@@ -127,13 +127,54 @@ export function pruneJobs(cwd) {
   for (const j of candidates.slice(MAX_JOBS)) {
     if (!isValidJobId(j.id)) continue;
     try { fs.unlinkSync(path.join(dir, `${j.id}.json`)); } catch {}
-    if (j.stdout_path && path.dirname(path.resolve(j.stdout_path)) === dir) {
+    if (j.stdout_path && safeJobLogPath(j.stdout_path, cwd)) {
       try { fs.unlinkSync(j.stdout_path); } catch {}
     }
-    if (j.stderr_path && path.dirname(path.resolve(j.stderr_path)) === dir) {
+    if (j.stderr_path && safeJobLogPath(j.stderr_path, cwd)) {
       try { fs.unlinkSync(j.stderr_path); } catch {}
     }
   }
+}
+
+// Confine a job-log path to the jobs directory. Job metadata is JSON we wrote
+// ourselves, but the file can be tampered with on disk by anything with write
+// access to ${CLAUDE_PLUGIN_DATA}. Without confinement, a manipulated stdout_path
+// could make /gemini:result read any user-readable file. Returns the resolved
+// path on success, or null if the path resolves outside jobsDir.
+export function safeJobLogPath(p, cwd) {
+  if (typeof p !== "string" || !p) return null;
+  const dir = path.resolve(jobsDir(cwd));
+  const resolved = path.resolve(p);
+  if (path.dirname(resolved) !== dir) return null;
+  return resolved;
+}
+
+// Purge non-running jobs older than maxAgeMs (default: all). Returns count.
+// Safe-by-construction: only operates on jobIds matching JOB_ID_PATTERN and
+// only unlinks log paths that resolve inside jobsDir.
+export function purgeJobs({ maxAgeMs = null, cwd } = {}) {
+  const all = listJobs(cwd);
+  const dir = jobsDir(cwd);
+  const cutoff = typeof maxAgeMs === "number" && maxAgeMs > 0
+    ? Date.now() - maxAgeMs
+    : null;
+  let purged = 0;
+  for (const j of all) {
+    if (j.status === "running") continue;
+    if (!isValidJobId(j.id)) continue;
+    if (cutoff !== null) {
+      const ts = Date.parse(j.ended_at || j.started_at || "");
+      if (!Number.isFinite(ts) || ts > cutoff) continue;
+    }
+    try { fs.unlinkSync(path.join(dir, `${j.id}.json`)); purged++; } catch {}
+    if (j.stdout_path && safeJobLogPath(j.stdout_path, cwd)) {
+      try { fs.unlinkSync(j.stdout_path); } catch {}
+    }
+    if (j.stderr_path && safeJobLogPath(j.stderr_path, cwd)) {
+      try { fs.unlinkSync(j.stderr_path); } catch {}
+    }
+  }
+  return purged;
 }
 
 // ---------- config (review gate) ----------

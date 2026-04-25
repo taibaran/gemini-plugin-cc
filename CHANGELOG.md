@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.5.0 — Product-readiness pass
+
+Closes the gap between "competent code" and "I'd let a teammate install
+this." Driven by an external review that scored the plugin 7.5/10 for
+architecture and 5.5–6/10 for product readiness — exactly right. This
+release closes most of that gap.
+
+### Hardening (P0)
+
+- **`--write` requires explicit opt-in.** Previously `--write` flipped
+  Gemini into `--approval-mode yolo` (it can modify files without
+  per-action confirmation) on a single flag. Now refused unless
+  `GEMINI_PLUGIN_ALLOW_WRITE=1` is set. The refusal message explains
+  exactly what's at stake. When write mode is active, `[gemini-plugin]
+  WRITE MODE ACTIVE` is emitted to stderr.
+- **Stop-review-gate strict mode.** New `GEMINI_REVIEW_GATE_STRICT=1`
+  flips the gate from fail-open (the default — a broken Gemini install
+  must not strand the user mid-session) to fail-closed for
+  infrastructure errors. Useful where "gate couldn't run" should mean
+  "don't stop yet."
+- **`safeJobLogPath` moved to `lib/state.mjs`** so it can be unit-tested
+  in isolation, and now consistently used by `pruneJobs` too (was
+  inlined there).
+
+### Robustness (P1)
+
+- **Model fallback chain.** New `MODEL_FALLBACK_CHAIN` and
+  `probeWithFallback()`: at setup, if the pinned default
+  (`gemini-3.1-pro-preview`) is not available for the user's account,
+  the plugin probes `gemini-3-pro-preview` then `gemini-2.5-pro` and
+  reports which one ended up working. An explicit `--model` or
+  `GEMINI_PLUGIN_MODEL` always wins over the chain. `classifyAuthBlob`
+  now detects `model unavailable` as its own category.
+- **CLI version check.** Setup now compares the local `gemini --version`
+  against `MIN_GEMINI_VERSION = 0.30.0` and surfaces an actionable
+  upgrade message when the installed version is too old.
+- **Real test suite.** 82 unit tests using Node's built-in
+  `node:test` runner — zero external dev dependencies. Coverage:
+  `args.mjs` (parsing, quoting, missing-value), `git.mjs`
+  (`isValidGitRef` rejection cases), `state.mjs`
+  (`isValidJobId`, `safeJobLogPath`, `purgeJobs` age filtering, atomic
+  write, config persistence), `process.mjs` (`isValidPid` boundaries,
+  `isAlive` for current/dead pids), `render.mjs` (`TerminalSanitizer`
+  including streaming split-CSI / split-OSC and incomplete-tail
+  drop-on-flush), `gemini.mjs` (`cleanGeminiEnv` dropping every secret
+  category, `compareVersions`, `checkMinVersion`, `effectiveModel`
+  precedence, expanded `classifyAuthBlob`), and the stop-gate verdict
+  parser (prompt-injection guard, brace-in-reason handling, fenced
+  JSON, malformed input).
+- **GitHub Actions CI.** `.github/workflows/ci.yml` runs on Node 20 and
+  22: syntax check on every `.mjs`, full test suite, plus a smoke job
+  that verifies the dispatcher, status command, and the new
+  write-refusal contract end-to-end.
+- **`flush()` of `TerminalSanitizer` now drops the held tail entirely**
+  (testing turned up that sanitizing-only would leak the bytes after an
+  ESC byte from an incomplete sequence). Partial sequences are unsafe
+  to emit at all.
+
+### New (P2)
+
+- **`/gemini:purge` subcommand.** Deletes recorded job metadata and log
+  files from disk. Optional `--older-than <duration>` filter
+  (`30d` / `12h` / `45m` / `60s`). Never touches still-running jobs.
+  Useful when local logs may contain sensitive code excerpts.
+- **Privacy / security section in the README.** Spells out exactly what
+  is sent to Google, what stays local, the env-scrubbing allowlist,
+  the write-mode gate, and the strict-mode toggle. The README was
+  previously written for "developer who already knows what they're
+  doing"; now it's also legible for someone deciding whether to install.
+
+### Removed
+
+- `--effort`, `--timeout-ms` and `lastTurnDiff()` were finally cleared
+  out in 0.4.3 — listed here only because the audit reraised them.
+
+### Known follow-ups
+
+- A "previous turn" snapshot for the stop-review-gate. The hook still
+  uses the working-tree diff as a proxy; faithfully limiting Gemini to
+  files touched in the last Claude turn requires a UserPromptSubmit
+  hook that snapshots HEAD/index state, which is real engineering work.
+- Skill-doc parity with the v0.5.0 changes (the `gemini-prompting` and
+  `gemini-cli-runtime` SKILLs do not yet mention `/gemini:purge` or the
+  write gate).
+
 ## 0.4.5 — Marketplace manifest + env scrubbing
 
 Closes the two issues a real install attempt surfaced:
