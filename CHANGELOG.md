@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.2 — Fix CI smoke test + cmdTask check order
+
+Two bugs surfaced when the v0.5.1 CI run failed on a runner without
+`gemini` installed.
+
+- **`cmdTask` now refuses `--write` before checking whether `gemini`
+  is installed.** Previously the order was `which("gemini") → exit 127`
+  then write-gate check. On a system where the binary is missing and
+  the user tries `--write`, that surfaced "Gemini CLI not installed"
+  instead of the policy refusal — confusing for a user ("install...
+  oh wait, refused for safety") and broken for CI (the smoke test
+  could never observe exit 2). The write-mode gate is a policy
+  decision about the local environment, not a question of whether
+  Gemini is reachable; it should always fire first.
+- **CI smoke test fixed.** The previous step piped node's output
+  through `tee`, which masked node's exit code with tee's (always 0).
+  The check `if [ "$rc" -ne 2 ]` was effectively comparing 0 against
+  2 — it would have failed even if the underlying logic were correct.
+  Now writes to a file directly, captures `$?` cleanly, and asserts
+  there is no "not installed" string in the output (regression test
+  for the order-bug above).
+- **New unit test pins the order**. Spawns the dispatcher with
+  `PATH=/nonexistent` so `which("gemini")` is guaranteed to fail, and
+  asserts the write-refusal still wins. 85 tests total.
+
 ## 0.5.1 — Polish on the v0.5.0 review (8/10 reviewer follow-ups)
 
 The v0.5.0 audit landed at 8/10 with five concrete polish items.

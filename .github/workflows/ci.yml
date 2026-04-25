@@ -57,7 +57,24 @@ jobs:
       - name: Write mode is refused without GEMINI_PLUGIN_ALLOW_WRITE
         run: |
           set +e
-          node scripts/companion.mjs task --write "test" 2>&1 | tee out.txt
+          # Don't pipe — `| tee` masks node's exit code with tee's (always 0).
+          node scripts/companion.mjs task --write "test" > out.txt 2>&1
           rc=$?
-          if [ "$rc" -ne 2 ]; then echo "Expected exit 2 from write refusal"; exit 1; fi
-          grep -q 'GEMINI_PLUGIN_ALLOW_WRITE' out.txt || (echo "Refusal message missing"; exit 1)
+          if [ "$rc" -ne 2 ]; then
+            echo "Expected exit 2 from write refusal, got $rc"
+            cat out.txt
+            exit 1
+          fi
+          if ! grep -q 'GEMINI_PLUGIN_ALLOW_WRITE' out.txt; then
+            echo "Refusal message missing"
+            cat out.txt
+            exit 1
+          fi
+          # Sanity check: make sure the refusal happens BEFORE the
+          # gemini-installed check (otherwise the runner without gemini
+          # would surface "not installed" instead of the policy reason).
+          if grep -q 'not installed' out.txt; then
+            echo "Refusal happened after the gemini-installed check"
+            cat out.txt
+            exit 1
+          fi

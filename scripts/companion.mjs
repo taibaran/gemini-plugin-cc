@@ -385,11 +385,14 @@ async function cmdTask({ flags, positional }) {
     console.error("Usage: task <description of what to do>");
     process.exit(2);
   }
-  if (!which("gemini")) {
-    console.error("Gemini CLI not installed. Run `/gemini:setup`.");
-    process.exit(127);
-  }
 
+  // The write-mode gate runs BEFORE the gemini-installed check intentionally:
+  // the gate is a policy decision about the local environment, not about
+  // whether Gemini is reachable. If we deferred the gate until after `which`
+  // succeeded, a CI runner without gemini would mask this refusal with a
+  // generic "not installed" error — and worse, a real user would see
+  // contradictory feedback ("install gemini... oh wait, refused for safety").
+  // Refusing first means the user always sees the policy reason.
   const isWrite = !!flags.write && !flags["read-only"];
   if (isWrite && process.env.GEMINI_PLUGIN_ALLOW_WRITE !== "1") {
     // Hardening: --write puts Gemini in --approval-mode yolo, which means it
@@ -407,6 +410,12 @@ async function cmdTask({ flags, positional }) {
     console.error("To enable persistently:        add it to ~/.claude/settings.json env.");
     process.exit(2);
   }
+
+  if (!which("gemini")) {
+    console.error("Gemini CLI not installed. Run `/gemini:setup`.");
+    process.exit(127);
+  }
+
   if (isWrite) {
     process.stderr.write("[gemini-plugin] WRITE MODE ACTIVE — Gemini may modify files in this workspace.\n");
   }

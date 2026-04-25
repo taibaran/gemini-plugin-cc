@@ -154,6 +154,35 @@ test("setActiveModel: persists model id and is clearable", () => {
   assert.equal(readConfig(process.cwd()).activeModel, undefined);
 });
 
+// Smoke test: the cmdTask write-gate must refuse BEFORE checking whether the
+// gemini binary is installed. If the order is reversed, a CI runner (no
+// gemini installed) sees "not installed" instead of the policy reason — and
+// worse, a real user sees contradictory feedback. This test invokes the
+// dispatcher directly with a guaranteed-missing PATH so `which("gemini")`
+// fails, and asserts the write refusal still wins.
+test("cmdTask: --write refusal fires BEFORE the gemini-not-installed check", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const path = await import("node:path");
+  const url = await import("node:url");
+  const here = path.dirname(url.fileURLToPath(import.meta.url));
+  const companion = path.resolve(here, "../scripts/companion.mjs");
+
+  const r = spawnSync(process.execPath, [companion, "task", "--write", "anything"], {
+    encoding: "utf8",
+    env: {
+      // Empty PATH guarantees `which gemini` fails. The refusal must still win.
+      PATH: "/nonexistent",
+      HOME: process.env.HOME || "/tmp",
+      // Critically: do NOT set GEMINI_PLUGIN_ALLOW_WRITE.
+      CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA
+    }
+  });
+
+  assert.equal(r.status, 2, `expected exit 2, got ${r.status}. stderr was: ${r.stderr}`);
+  assert.match((r.stderr || "") + (r.stdout || ""), /GEMINI_PLUGIN_ALLOW_WRITE/);
+  assert.doesNotMatch((r.stderr || "") + (r.stdout || ""), /not installed/);
+});
+
 test("setActiveModel: rejects invalid model ids (defense against config tamper)", () => {
   const bad = [
     "model;rm-rf",
