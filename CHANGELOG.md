@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.4 — Refactor + ANSI/OSC sanitization
+
+Closes the two follow-ups left over from v0.4.3 — the duplicated job-running
+boilerplate and the deferred terminal-injection hardening.
+
+- **Shared `runJob()` helper.** `cmdReview` and `cmdTask` used to duplicate
+  ~40 lines of intricate background-job plumbing (fd setup, spawn,
+  streaming, status transitions, cancellation race handling, error
+  surfacing). The shared helper makes it impossible for one to drift
+  away from the other in subtle ways — the missing `detached: true` on
+  cmdReview that we fixed in v0.4.3 was a direct symptom of that drift.
+  Both commands now delegate to one place. Callers receive `{ code,
+  outBuf, errBuf }` and own only their own post-processing (JSON
+  unwrapping for review, footer for task).
+- **ANSI / OSC sanitization on terminal output.** A hostile diff or
+  document fed into Gemini could trick it into echoing terminal control
+  sequences — color codes, cursor moves, OSC title-bar updates, OSC 52
+  clipboard writes — into the user's terminal. New
+  `lib/render.mjs:TerminalSanitizer` strips:
+    - CSI sequences (`ESC [ ... <0x40-0x7e>`)
+    - OSC sequences (`ESC ] ... BEL` or `ESC \\`)
+    - DCS / PM / APC / SOS strings
+    - Single-shift / private 2-byte intros
+    - Dangerous C0 control bytes (NUL, BS, BEL, VT, FF, SO/SI, DLE-SUB,
+      ESC, FS-US, DEL). Tab, newline, and CR are kept.
+  The sanitizer is **stream-aware** — it holds back any incomplete
+  escape sequence at a chunk boundary and resumes parsing on the next
+  chunk, so a sequence split across two reads cannot leak through.
+  Wired into:
+    - `cmdAsk` stdout/stderr (`spawnSync` result)
+    - `runJob` live stdout streaming (review, task)
+    - `cmdResult` stdout/stderr read-from-disk path
+  Disk logs are **not** sanitized — raw bytes are kept for debugging.
+  Only the live streams that hit the terminal are filtered.
+- **Async dispatch.** `main()` is async and awaits the new
+  `cmdReview` / `cmdTask` / `cmdCancel` promises so unhandled-promise
+  warnings (or premature exits) cannot occur on subcommand failure.
+
 ## 0.4.3 — Bug-fix pass after dual Codex+Gemini review
 
 Both Codex (via `codex:codex-rescue`) and Gemini (via this plugin's own

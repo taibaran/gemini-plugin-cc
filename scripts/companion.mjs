@@ -21,7 +21,7 @@ import {
   detectAuthSource, geminiBaseArgs, effectiveModel, DEFAULT_MODEL
 } from "./lib/gemini.mjs";
 import { buildReviewPrompt } from "./lib/prompts.mjs";
-import { renderJobTable, renderJobDetails, fmtTime } from "./lib/render.mjs";
+import { renderJobTable, renderJobDetails, fmtTime, TerminalSanitizer, sanitizeForTerminal } from "./lib/render.mjs";
 
 // ---------- subcommand: setup ----------
 
@@ -124,13 +124,128 @@ function cmdAsk({ flags, positional }) {
   }
   const args = ["-p", prompt, ...geminiBaseArgs({ readOnly: true, model: flags.model })];
   const r = spawnSync("gemini", args, { encoding: "utf8" });
-  process.stdout.write(r.stdout || "");
+  process.stdout.write(sanitizeForTerminal(r.stdout || ""));
   if (r.status !== 0) {
-    if (r.stderr) process.stderr.write(r.stderr);
+    if (r.stderr) process.stderr.write(sanitizeForTerminal(r.stderr));
     const why = classifyAuthBlob((r.stdout || "") + "\n" + (r.stderr || ""));
     if (why) process.stderr.write(`\n[hint: ${why}. Run /gemini:setup.]\n`);
   }
   process.exit(r.status ?? 0);
+}
+
+// ---------- shared job runner ----------
+
+const MAX_JOB_BUF = 256 * 1024;
+
+// Spawn `gemini`, stream output to a job log on disk (and optionally to the
+// user's stdout, sanitized), and resolve when the process closes. Used by
+// both cmdReview and cmdTask so process-group handling, buffer caps, status
+// transitions, and error surfacing live in exactly one place.
+//
+// Caller fills `meta` with id/kind/task_text/etc. and the stdout_path /
+// stderr_path under jobsDir(). This function fills in pid, status,
+// ended_at, exit_code, and persists meta on every transition.
+function runJob({ args, meta, stdin = null, showStdout = true }) {
+  return new Promise((resolve, reject) => {
+    ensureDir(jobsDir());
+    const stdoutFd = fs.openSync(meta.stdout_path, "w");
+    const stderrFd = fs.openSync(meta.stderr_path, "w");
+
+    const stdio = stdin !== null
+      ? ["pipe", "pipe", "pipe"]
+      : ["ignore", "pipe", "pipe"];
+
+    const proc = spawn("gemini", args, { stdio, detached: true });
+    meta.pid = proc.pid;
+    writeJobMeta(meta.id, meta);
+    pruneJobs();
+
+    if (stdin !== null) {
+      proc.stdin.write(stdin);
+      proc.stdin.end();
+    }
+
+    let outBuf = "", errBuf = "";
+    const sanitizer = new TerminalSanitizer();
+
+    proc.stdout.on("data", d => {
+      fs.writeSync(stdoutFd, d);
+      if (showStdout) {
+        const safe = sanitizer.push(d);
+        if (safe) process.stdout.write(safe);
+      }
+      if (outBuf.length < MAX_JOB_BUF) {
+        outBuf += d.toString().slice(0, MAX_JOB_BUF - outBuf.length);
+      }
+    });
+    proc.stderr.on("data", d => {
+      fs.writeSync(stderrFd, d);
+      if (errBuf.length < MAX_JOB_BUF) {
+        errBuf += d.toString().slice(0, MAX_JOB_BUF - errBuf.length);
+      }
+    });
+
+    proc.on("close", code => {
+      try { fs.closeSync(stdoutFd); } catch {}
+      try { fs.closeSync(stderrFd); } catch {}
+      if (showStdout) {
+        const tail = sanitizer.flush();
+        if (tail) process.stdout.write(tail);
+      }
+
+      // killJob (cmdCancel) writes status: cancelled BEFORE this close fires,
+      // so re-read meta from disk to avoid race-overwriting "cancelled" with
+      // "failed" when a SIGTERM'd Gemini exits non-zero.
+      const current = readJobMeta(meta.id) || meta;
+      if (current.status === "cancelled") {
+        current.exit_code = code;
+        writeJobMeta(meta.id, current);
+        meta.status = "cancelled";
+      } else {
+        meta.status = code === 0 ? "completed" : "failed";
+        meta.exit_code = code;
+        meta.ended_at = new Date().toISOString();
+        writeJobMeta(meta.id, meta);
+      }
+
+      if (code !== 0 && meta.status !== "cancelled") {
+        if (errBuf) process.stderr.write(sanitizeForTerminal(errBuf));
+        const why = classifyAuthBlob(outBuf + "\n" + errBuf);
+        if (why) process.stderr.write(`\n[hint: ${why}. Run /gemini:setup.]\n`);
+      }
+
+      resolve({ code, outBuf, errBuf });
+    });
+
+    proc.on("error", err => {
+      try { fs.closeSync(stdoutFd); } catch {}
+      try { fs.closeSync(stderrFd); } catch {}
+      meta.status = "failed";
+      meta.exit_code = -1;
+      meta.error = err.message;
+      meta.ended_at = new Date().toISOString();
+      writeJobMeta(meta.id, meta);
+      reject(err);
+    });
+  });
+}
+
+function buildJobMeta({ kind, args, task_text, extra = {} }) {
+  const id = newJobId();
+  const dir = jobsDir();
+  return {
+    version: 1,
+    id,
+    kind,
+    pid: null,
+    command: ["gemini", ...args],
+    started_at: new Date().toISOString(),
+    status: "running",
+    stdout_path: path.join(dir, `${id}.stdout.log`),
+    stderr_path: path.join(dir, `${id}.stderr.log`),
+    task_text,
+    ...extra
+  };
 }
 
 // ---------- subcommand: review / adversarial-review ----------
@@ -148,7 +263,7 @@ function validateReviewSchemaShallow(obj) {
   return null;
 }
 
-function cmdReview({ flags, positional }, { adversarial }) {
+async function cmdReview({ flags, positional }, { adversarial }) {
   if (!which("gemini")) {
     console.error("Gemini CLI not installed. Run `/gemini:setup`.");
     process.exit(127);
@@ -180,119 +295,53 @@ function cmdReview({ flags, positional }, { adversarial }) {
   const prompt = buildReviewPrompt({ adversarial, focus, target, jsonOutput });
   const args = ["-p", prompt, ...geminiBaseArgs({ readOnly: true, model: flags.model, jsonOutput })];
 
-  // Track this review as a job so /gemini:status surfaces it (matches the
-  // hint we publish from commands/review.md when running in background mode).
-  const jobId = newJobId();
-  const dir = jobsDir();
-  ensureDir(dir);
-  const stdoutPath = path.join(dir, `${jobId}.stdout.log`);
-  const stderrPath = path.join(dir, `${jobId}.stderr.log`);
-
-  const meta = {
-    version: 1,
-    id: jobId,
+  const meta = buildJobMeta({
     kind: adversarial ? "adversarial-review" : "review",
-    pid: null,
-    command: ["gemini", ...args],
-    started_at: new Date().toISOString(),
-    status: "running",
-    stdout_path: stdoutPath,
-    stderr_path: stderrPath,
+    args,
     task_text: `${target}${focus ? ` — focus: ${focus}` : ""}`,
-    json_output: jsonOutput,
-    model: flags.model || null
-  };
-
-  const stdoutFd = fs.openSync(stdoutPath, "w");
-  const stderrFd = fs.openSync(stderrPath, "w");
-
-  const proc = spawn("gemini", args, { stdio: ["pipe", "pipe", "pipe"], detached: true });
-  meta.pid = proc.pid;
-  writeJobMeta(jobId, meta);
-  pruneJobs();
-
-  proc.stdin.write(diffResult.diff);
-  proc.stdin.end();
-
-  const MAX_BUF = 256 * 1024;
-  let outBuf = "", errBuf = "";
-  proc.stdout.on("data", d => {
-    fs.writeSync(stdoutFd, d);
-    if (!jsonOutput) process.stdout.write(d);
-    if (outBuf.length < MAX_BUF) outBuf += d.toString().slice(0, MAX_BUF - outBuf.length);
+    extra: { json_output: jsonOutput, model: flags.model || null }
   });
-  proc.stderr.on("data", d => {
-    fs.writeSync(stderrFd, d);
-    if (errBuf.length < MAX_BUF) errBuf += d.toString().slice(0, MAX_BUF - errBuf.length);
-  });
-  proc.on("close", code => {
-    try { fs.closeSync(stdoutFd); } catch {}
-    try { fs.closeSync(stderrFd); } catch {}
-    const current = readJobMeta(jobId) || meta;
-    if (current.status === "cancelled") {
-      current.exit_code = code;
-      writeJobMeta(jobId, current);
-    } else {
-      meta.status = code === 0 ? "completed" : "failed";
-      meta.exit_code = code;
-      meta.ended_at = new Date().toISOString();
-      writeJobMeta(jobId, meta);
-    }
 
-    if (code !== 0) {
-      if (errBuf) process.stderr.write(errBuf);
-      const why = classifyAuthBlob(outBuf + "\n" + errBuf);
-      if (why) process.stderr.write(`\n[hint: ${why}. Run /gemini:setup.]\n`);
-      process.exit(code ?? 0);
-    }
-    if (jsonOutput) {
-      // Gemini's `-o json` returns: { session_id, response, stats }.
-      // Strip the wrapper, strip markdown fences, validate shallow shape,
-      // then emit clean JSON. Re-read the full stdout file from disk —
-      // outBuf is capped at MAX_BUF and a JSON payload near or past that
-      // cap would be corrupted as a parse target. The on-disk file has
-      // no cap.
-      let fullOut;
-      try { fullOut = fs.readFileSync(stdoutPath, "utf8"); } catch { fullOut = outBuf; }
-      try {
-        const wrapper = JSON.parse(fullOut);
-        let inner = (wrapper.response ?? "").trim();
-        const fenced = inner.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
-        if (fenced) inner = fenced[1].trim();
-        const parsed = JSON.parse(inner);
-        const why = validateReviewSchemaShallow(parsed);
-        if (why) {
-          // Schema mismatch: still emit the unwrapped payload (not the
-          // CLI wrapper). The wrapper is { session_id, response, stats }
-          // and is never what a downstream JSON consumer wants.
-          process.stderr.write(`[gemini-plugin] review --json: schema mismatch (${why}). Returning unwrapped payload.\n`);
-          process.stdout.write(JSON.stringify(parsed, null, 2) + "\n");
-        } else {
-          process.stdout.write(JSON.stringify(parsed, null, 2) + "\n");
-        }
-      } catch {
-        // Could not parse as JSON wrapper at all — emit whatever we have.
-        process.stdout.write(fullOut);
-      }
-    }
-    process.exit(0);
-  });
-  proc.on("error", err => {
-    try { fs.closeSync(stdoutFd); } catch {}
-    try { fs.closeSync(stderrFd); } catch {}
-    meta.status = "failed";
-    meta.exit_code = -1;
-    meta.error = err.message;
-    meta.ended_at = new Date().toISOString();
-    writeJobMeta(jobId, meta);
+  let result;
+  try {
+    result = await runJob({ args, meta, stdin: diffResult.diff, showStdout: !jsonOutput });
+  } catch (err) {
     console.error(`Failed to spawn gemini: ${err.message}`);
     process.exit(127);
-  });
+  }
+
+  if (result.code === 0 && jsonOutput) {
+    // Gemini's `-o json` returns: { session_id, response, stats }. Strip the
+    // wrapper, strip markdown fences, validate shallow shape, emit clean JSON.
+    // We re-read the full stdout file from disk because runJob's outBuf is
+    // capped at MAX_JOB_BUF — a JSON payload near that cap would corrupt the
+    // parse otherwise. The on-disk file has no cap.
+    let fullOut;
+    try { fullOut = fs.readFileSync(meta.stdout_path, "utf8"); } catch { fullOut = result.outBuf; }
+    try {
+      const wrapper = JSON.parse(fullOut);
+      let inner = (wrapper.response ?? "").trim();
+      const fenced = inner.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+      if (fenced) inner = fenced[1].trim();
+      const parsed = JSON.parse(inner);
+      const why = validateReviewSchemaShallow(parsed);
+      if (why) {
+        // Schema mismatch: emit the unwrapped payload anyway (the wrapper is
+        // never what a downstream JSON consumer wants), with a stderr warning.
+        process.stderr.write(`[gemini-plugin] review --json: schema mismatch (${why}). Returning unwrapped payload.\n`);
+      }
+      process.stdout.write(JSON.stringify(parsed, null, 2) + "\n");
+    } catch {
+      process.stdout.write(fullOut);
+    }
+  }
+
+  process.exit(result.code ?? 0);
 }
 
 // ---------- subcommand: task ----------
 
-function cmdTask({ flags, positional }) {
+async function cmdTask({ flags, positional }) {
   const taskText = positional.join(" ").trim();
   if (!taskText) {
     console.error("Usage: task <description of what to do>");
@@ -304,87 +353,25 @@ function cmdTask({ flags, positional }) {
   }
 
   const isWrite = !!flags.write && !flags["read-only"];
-  const jobId = newJobId();
-  const dir = jobsDir();
-  ensureDir(dir);
-  const stdoutPath = path.join(dir, `${jobId}.stdout.log`);
-  const stderrPath = path.join(dir, `${jobId}.stderr.log`);
-
-  const args = [
-    "-p", taskText,
-    ...geminiBaseArgs({ readOnly: !isWrite, model: flags.model })
-  ];
-
-  const meta = {
-    version: 1,
-    id: jobId,
+  const args = ["-p", taskText, ...geminiBaseArgs({ readOnly: !isWrite, model: flags.model })];
+  const meta = buildJobMeta({
     kind: "task",
-    write: isWrite,
-    pid: null,
-    command: ["gemini", ...args],
-    started_at: new Date().toISOString(),
-    status: "running",
-    stdout_path: stdoutPath,
-    stderr_path: stderrPath,
+    args,
     task_text: taskText,
-    model: flags.model || null
-  };
-
-  const stdoutFd = fs.openSync(stdoutPath, "w");
-  const stderrFd = fs.openSync(stderrPath, "w");
-
-  const proc = spawn("gemini", args, {
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: true
-  });
-  meta.pid = proc.pid;
-  writeJobMeta(jobId, meta);
-  pruneJobs();
-
-  proc.stdout.on("data", chunk => {
-    process.stdout.write(chunk);
-    fs.writeSync(stdoutFd, chunk);
-  });
-  proc.stderr.on("data", chunk => {
-    fs.writeSync(stderrFd, chunk);
+    extra: { write: isWrite, model: flags.model || null }
   });
 
-  proc.on("close", code => {
-    try { fs.closeSync(stdoutFd); } catch {}
-    try { fs.closeSync(stderrFd); } catch {}
-    const current = readJobMeta(jobId) || meta;
-    if (current.status === "cancelled") {
-      current.exit_code = code;
-      writeJobMeta(jobId, current);
-      meta.status = "cancelled";
-    } else {
-      meta.status = code === 0 ? "completed" : "failed";
-      meta.exit_code = code;
-      meta.ended_at = new Date().toISOString();
-      writeJobMeta(jobId, meta);
-    }
-    if (code !== 0 && meta.status !== "cancelled") {
-      try {
-        const errOut = fs.readFileSync(stderrPath, "utf8");
-        if (errOut) process.stderr.write(errOut);
-      } catch {}
-    }
-    process.stdout.write(`\n\n[gemini-plugin] Job ${jobId} ${meta.status} (exit ${code}).\n`);
-    process.stdout.write(`[gemini-plugin] /gemini:result ${jobId}\n`);
-    process.exit(code ?? 0);
-  });
-
-  proc.on("error", err => {
-    try { fs.closeSync(stdoutFd); } catch {}
-    try { fs.closeSync(stderrFd); } catch {}
-    meta.status = "failed";
-    meta.exit_code = -1;
-    meta.error = err.message;
-    meta.ended_at = new Date().toISOString();
-    writeJobMeta(jobId, meta);
+  let result;
+  try {
+    result = await runJob({ args, meta, stdin: null, showStdout: true });
+  } catch (err) {
     console.error(`Failed to spawn gemini: ${err.message}`);
     process.exit(127);
-  });
+  }
+
+  process.stdout.write(`\n\n[gemini-plugin] Job ${meta.id} ${meta.status} (exit ${result.code}).\n`);
+  process.stdout.write(`[gemini-plugin] /gemini:result ${meta.id}\n`);
+  process.exit(result.code ?? 0);
 }
 
 // ---------- subcommand: status ----------
@@ -457,7 +444,7 @@ function cmdResult({ positional }) {
   } else {
     try {
       const out = fs.readFileSync(safeOut, "utf8");
-      process.stdout.write(out || "(no output)\n");
+      process.stdout.write(sanitizeForTerminal(out || "(no output)\n"));
     } catch (e) {
       console.log(`(could not read stdout: ${e.message})`);
     }
@@ -468,7 +455,7 @@ function cmdResult({ positional }) {
     if (safeErr) {
       try {
         const err = fs.readFileSync(safeErr, "utf8");
-        process.stdout.write(err);
+        process.stdout.write(sanitizeForTerminal(err));
       } catch {}
     }
   }
@@ -516,7 +503,7 @@ async function cmdCancel({ positional }) {
 
 // ---------- main ----------
 
-function main() {
+async function main() {
   const [, , sub, ...rest] = process.argv;
   if (!sub) {
     console.error("Usage: companion.mjs <setup|ask|review|adversarial-review|task|status|result|cancel> [args...]");
@@ -532,12 +519,12 @@ function main() {
   switch (sub) {
     case "setup": return cmdSetup(args);
     case "ask": return cmdAsk(args);
-    case "review": return cmdReview(args, { adversarial: false });
-    case "adversarial-review": return cmdReview(args, { adversarial: true });
-    case "task": return cmdTask(args);
+    case "review": return await cmdReview(args, { adversarial: false });
+    case "adversarial-review": return await cmdReview(args, { adversarial: true });
+    case "task": return await cmdTask(args);
     case "status": return cmdStatus(args);
     case "result": return cmdResult(args);
-    case "cancel": return cmdCancel(args);
+    case "cancel": return await cmdCancel(args);
     default:
       console.error(`Unknown subcommand: ${sub}`);
       console.error("Usage: companion.mjs <setup|ask|review|adversarial-review|task|status|result|cancel> [args...]");
@@ -545,4 +532,7 @@ function main() {
   }
 }
 
-main();
+main().catch(err => {
+  console.error(`gemini-plugin fatal: ${err && err.message ? err.message : err}`);
+  process.exit(1);
+});
