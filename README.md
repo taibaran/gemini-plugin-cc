@@ -42,7 +42,7 @@ All slash commands invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/companion.mjs" <s
 ## Requirements
 
 - macOS or Linux
-- Node.js 18+ and npm
+- Node.js 20+ and npm (matches CI matrix; `package.json` declares `engines.node`)
 - Gemini CLI: `npm install -g @google/gemini-cli`
 - Authentication, choose one:
   - Run `!gemini` once and complete the Google OAuth flow

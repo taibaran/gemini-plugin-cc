@@ -1,6 +1,6 @@
 {
   "name": "gemini",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Use Gemini from Claude Code to ask questions, review code, or delegate tasks. Wraps the local @google/gemini-cli.",
   "author": {
     "name": "taibaran"

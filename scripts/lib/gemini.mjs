@@ -2,6 +2,7 @@
 // and a curated environment for the spawned `gemini` process.
 
 import { spawnSync } from "node:child_process";
+import { readConfig } from "./state.mjs";
 
 export const AUTH_PROBE_TIMEOUT_MS = 30_000;
 
@@ -69,9 +70,35 @@ export const MODEL_FALLBACK_CHAIN = [
 // versions may not support `--approval-mode plan` or our flag set.
 export const MIN_GEMINI_VERSION = "0.30.0";
 
-export function effectiveModel(callerModel) {
+// Precedence for model selection (highest wins):
+//   1. callerModel argument (per-call --model flag)
+//   2. GEMINI_PLUGIN_MODEL env var (global override)
+//   3. workspace config.activeModel (set by setup's fallback chain when the
+//      DEFAULT_MODEL is unavailable for this account)
+//   4. DEFAULT_MODEL
+//
+// The workspace-config tier closes the gap reported in the v0.5.0 review:
+// previously setup's fallback chain only reflected in setup's own report,
+// and per-call invocations would still try the unavailable DEFAULT_MODEL.
+export function effectiveModel(callerModel, cwd) {
   if (callerModel) return callerModel;
   if (process.env.GEMINI_PLUGIN_MODEL) return process.env.GEMINI_PLUGIN_MODEL;
+  if (cwd !== undefined) {
+    try {
+      const cfg = readConfig(cwd);
+      if (cfg && typeof cfg.activeModel === "string" && cfg.activeModel) {
+        return cfg.activeModel;
+      }
+    } catch {}
+  } else {
+    // No explicit cwd passed — peek at the current workspace's config.
+    try {
+      const cfg = readConfig(process.cwd());
+      if (cfg && typeof cfg.activeModel === "string" && cfg.activeModel) {
+        return cfg.activeModel;
+      }
+    } catch {}
+  }
   return DEFAULT_MODEL;
 }
 

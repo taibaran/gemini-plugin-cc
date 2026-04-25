@@ -5,14 +5,14 @@
   },
   "metadata": {
     "description": "Single-plugin marketplace publishing the gemini-plugin-cc Claude Code plugin.",
-    "version": "0.5.0"
+    "version": "0.5.1"
   },
   "plugins": [
     {
       "name": "gemini",
       "source": ".",
       "description": "Use Google's Gemini from Claude Code: ask, review, adversarial-review, long-form research via the rescue subagent. Wraps the local @google/gemini-cli with model pinning, env scrubbing, ANSI sanitization, and stop-time review gate.",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "author": { "name": "taibaran" },
       "category": "ai-assistance",
       "tags": ["gemini", "code-review", "research", "rescue-agent"],

@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.5.1 — Polish on the v0.5.0 review (8/10 reviewer follow-ups)
+
+The v0.5.0 audit landed at 8/10 with five concrete polish items.
+This release closes them.
+
+- **Model fallback now persists.** Previously `probeWithFallback()` only
+  affected setup's own report; later `/gemini:ask` / `/gemini:review` /
+  `/gemini:task` calls would still try the unavailable `DEFAULT_MODEL`
+  and re-fail. Setup now writes the working fallback to the workspace
+  config (`activeModel`) via the new `setActiveModel()`. `effectiveModel()`
+  reads it back as a third-priority tier between env and default.
+  Precedence is now: caller `--model` → `GEMINI_PLUGIN_MODEL` env →
+  `config.activeModel` → `DEFAULT_MODEL`. When the default works again
+  on a later setup run, the persisted fallback is automatically cleared.
+- **Stop-gate strict mode now covers the fatal catch.** The outer
+  `try/catch` in `stop-review-gate-hook.mjs` previously called
+  `emitAllow()` even in strict mode, contradicting the documented
+  contract. Now routes through `emitInfraFailure()` so strict mode
+  blocks here too.
+- **Node version aligned across README, package.json, and CI.** README
+  said 18+, `package.json` declared `>=20`, CI ran 20/22. Settled on
+  Node 20+ everywhere.
+- **Skill docs now mention `/gemini:purge` and the write gate.**
+  `gemini-cli-runtime` documents that `--write` is gated by
+  `GEMINI_PLUGIN_ALLOW_WRITE=1` and tells the rescue subagent to
+  surface the refusal verbatim. `gemini-prompting` documents the new
+  precedence chain and the write-mode contract.
+- **2 new tests (84 total).** `state.test.mjs` covers `setActiveModel`
+  roundtrip and rejection of malformed model ids (defense against
+  config tampering: shell metacharacters, paths, oversize). The
+  `effectiveModel` test in `gemini.test.mjs` is rewritten to verify
+  the full four-tier precedence including the new config tier, with
+  proper workspace isolation via `CLAUDE_PLUGIN_DATA`.
+
 ## 0.5.0 — Product-readiness pass
 
 Closes the gap between "competent code" and "I'd let a teammate install

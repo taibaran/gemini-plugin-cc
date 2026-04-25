@@ -12,7 +12,7 @@ import { parseArgs, COMMON_BOOL_FLAGS, COMMON_VALUE_FLAGS } from "./lib/args.mjs
 import {
   ensureDir, jobsDir, newJobId,
   writeJobMeta, readJobMeta, listJobs, pruneJobs,
-  readConfig, setReviewGate, safeJobLogPath, purgeJobs
+  readConfig, setReviewGate, safeJobLogPath, purgeJobs, setActiveModel
 } from "./lib/state.mjs";
 import { isAlive, terminateProcessTree } from "./lib/process.mjs";
 import { captureDiff } from "./lib/git.mjs";
@@ -85,11 +85,26 @@ function cmdSetup({ flags }) {
     // which falsely implies oauth is configured when nothing is.
     result.auth.source = probe.ok ? detectAuthSource() : null;
     if (probe.fallbackUsed) {
+      // Persist to workspace config so per-call invocations
+      // (/gemini:ask, /gemini:review, /gemini:task, /gemini:rescue)
+      // inherit the working model, not just setup's report. effectiveModel()
+      // reads this back. --model and GEMINI_PLUGIN_MODEL still win over it.
+      setActiveModel(process.cwd(), probe.fallbackUsed);
       result.model.active = probe.fallbackUsed;
       result.model.fallbackUsed = probe.fallbackUsed;
       result.actionsTaken.push(
-        `Default model ${result.model.default} unavailable; falling back to ${probe.fallbackUsed} for this session. Set GEMINI_PLUGIN_MODEL to pin a different model.`
+        `Default model ${result.model.default} unavailable; persisting fallback ${probe.fallbackUsed} for this workspace. Future /gemini:* commands here will use it. Override with --model or GEMINI_PLUGIN_MODEL.`
       );
+    } else if (probe.ok) {
+      // Default worked — clear any stale fallback we persisted on a previous
+      // run when the default was temporarily down.
+      const cfg = readConfig(process.cwd());
+      if (cfg.activeModel && cfg.activeModel !== result.model.default) {
+        setActiveModel(process.cwd(), null);
+        result.actionsTaken.push(
+          `Default model ${result.model.default} is available again; cleared persisted fallback ${cfg.activeModel}.`
+        );
+      }
     }
     if (!probe.ok) {
       if (probe.detail === "model unavailable") {

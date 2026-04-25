@@ -218,5 +218,8 @@ try {
   main();
 } catch (err) {
   process.stderr.write(`stop-review-gate-hook fatal: ${err.message}\n`);
-  emitAllow("review gate fatal error");
+  // Route through emitInfraFailure so STRICT mode actually blocks here.
+  // Previously this catch unconditionally allowed even in strict mode,
+  // which contradicts the strict-mode contract documented in the README.
+  emitInfraFailure(`review gate fatal error: ${err.message}`);
 }

@@ -40,7 +40,11 @@ A good rescue prompt for Gemini is short, direct, and grounded:
 
 ## Model selection
 
-- **Model** — only set `--model` when the user names one (e.g., `gemini-2.5-pro`). Otherwise leave it unset; the plugin's `lib/gemini.mjs:DEFAULT_MODEL` (currently `gemini-3.1-pro-preview`) is what every call defaults to. Do not assume "the CLI default" — the plugin pins the model on every invocation, so consistency comes from there, not from the CLI.
+- **Model** — only set `--model` when the user names one (e.g., `gemini-2.5-pro`). Otherwise leave it unset. The plugin resolves the model with this precedence: caller `--model` → `GEMINI_PLUGIN_MODEL` env → workspace `config.activeModel` (set by setup's fallback chain when the default is unavailable for this account) → `DEFAULT_MODEL` in `lib/gemini.mjs` (currently `gemini-3.1-pro-preview`). Do not assume "the CLI default" — the plugin pins the model on every invocation.
+
+## Write mode
+
+- The user's request may include `--write`. Pass it through unchanged. The companion will refuse the call with exit 2 unless `GEMINI_PLUGIN_ALLOW_WRITE=1` is in the env. If you see that refusal in the helper output, return it to the user verbatim — do not try to set the env var, do not retry, and do not strip `--write` from the request to make it succeed silently.
 
 ## When NOT to rephrase
 

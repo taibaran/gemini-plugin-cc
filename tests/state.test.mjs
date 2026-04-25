@@ -14,7 +14,8 @@ import {
   jobsDir,
   safeJobLogPath,
   setReviewGate,
-  readConfig
+  readConfig,
+  setActiveModel
 } from "../scripts/lib/state.mjs";
 
 // Each test gets a fresh CLAUDE_PLUGIN_DATA so state writes are isolated.
@@ -144,4 +145,31 @@ test("setReviewGate / readConfig: persists toggle", () => {
   assert.equal(readConfig(process.cwd()).reviewGateEnabled, true);
   setReviewGate(process.cwd(), false);
   assert.equal(readConfig(process.cwd()).reviewGateEnabled, false);
+});
+
+test("setActiveModel: persists model id and is clearable", () => {
+  setActiveModel(process.cwd(), "gemini-2.5-pro");
+  assert.equal(readConfig(process.cwd()).activeModel, "gemini-2.5-pro");
+  setActiveModel(process.cwd(), null);
+  assert.equal(readConfig(process.cwd()).activeModel, undefined);
+});
+
+test("setActiveModel: rejects invalid model ids (defense against config tamper)", () => {
+  const bad = [
+    "model;rm-rf",
+    "model with space",
+    "model$(echo)",
+    "model/with/slash",
+    "../escape",
+    "a".repeat(65),
+    "",
+    null  // null is the legitimate "clear" value, but other falsy types are bugs
+  ];
+  for (const v of bad) {
+    if (v === null) continue;  // null is the documented clear sentinel
+    let err;
+    try { setActiveModel(process.cwd(), v); } catch (e) { err = e; }
+    assert.equal(/invalid model id/.test(err && err.message || ""), true,
+      `expected rejection for ${JSON.stringify(v)}`);
+  }
 });

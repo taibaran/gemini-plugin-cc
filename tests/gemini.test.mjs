@@ -118,14 +118,34 @@ test("checkMinVersion: handles unparseable string", () => {
   assert.equal(r.ok, false);
 });
 
-test("effectiveModel: honors caller arg, then env, then default", () => {
-  assert.equal(effectiveModel("gemini-2.5-pro"), "gemini-2.5-pro");
-  // Without setting env, falls back to DEFAULT_MODEL.
+test("effectiveModel: honors caller arg, then env, then workspace config, then default", async () => {
+  // Isolate workspace state to a tmp dir so we don't read the host's real config.
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const tmpData = fs.mkdtempSync(path.join(os.tmpdir(), "gemini-plugin-test-em-"));
+  process.env.CLAUDE_PLUGIN_DATA = tmpData;
   delete process.env.GEMINI_PLUGIN_MODEL;
-  assert.equal(effectiveModel(), DEFAULT_MODEL);
-  process.env.GEMINI_PLUGIN_MODEL = "custom-model-id";
-  assert.equal(effectiveModel(), "custom-model-id");
+
+  // Pure default: no caller, no env, no config.
+  assert.equal(effectiveModel(undefined, tmpData), DEFAULT_MODEL);
+
+  // Caller arg wins over everything.
+  process.env.GEMINI_PLUGIN_MODEL = "env-model";
+  assert.equal(effectiveModel("caller-model", tmpData), "caller-model");
+
+  // Env wins over config + default.
+  assert.equal(effectiveModel(undefined, tmpData), "env-model");
   delete process.env.GEMINI_PLUGIN_MODEL;
+
+  // Config wins over default when env is unset.
+  const { setActiveModel } = await import("../scripts/lib/state.mjs");
+  setActiveModel(tmpData, "config-model");
+  assert.equal(effectiveModel(undefined, tmpData), "config-model");
+
+  // Clearing config falls back to default.
+  setActiveModel(tmpData, null);
+  assert.equal(effectiveModel(undefined, tmpData), DEFAULT_MODEL);
 });
 
 test("MIN_GEMINI_VERSION is sane", () => {

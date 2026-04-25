@@ -1,6 +1,6 @@
 {
   "name": "gemini-plugin-cc",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Claude Code plugin to call Google Gemini for ask, review, and long-form research. Tests use Node's built-in test runner — no external dev dependencies.",
   "private": true,
   "type": "module",

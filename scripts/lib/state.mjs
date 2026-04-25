@@ -202,3 +202,24 @@ export function setReviewGate(cwd, enabled) {
   writeConfig(cwd, c);
   return c;
 }
+
+// Persist the model that setup's fallback chain landed on, so subsequent
+// per-workspace invocations of /gemini:ask, /gemini:review, /gemini:task
+// inherit it. Pass null to clear (e.g. when the configured default works
+// again on a later setup). The model id is validated to avoid persisting
+// arbitrary strings written by a hostile config tamper.
+const MODEL_ID_PATTERN = /^[a-zA-Z0-9._-]{1,64}$/;
+export function setActiveModel(cwd, model) {
+  const c = readConfig(cwd);
+  if (model === null || model === undefined) {
+    delete c.activeModel;
+  } else {
+    if (typeof model !== "string" || !MODEL_ID_PATTERN.test(model)) {
+      throw new Error(`invalid model id: ${String(model).slice(0, 64)}`);
+    }
+    c.activeModel = model;
+  }
+  c.version = STATE_VERSION;
+  writeConfig(cwd, c);
+  return c;
+}
