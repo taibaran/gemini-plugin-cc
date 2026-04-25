@@ -74,13 +74,18 @@ Then inside Claude Code:
 /gemini:status
 ```
 
-## Install permanently (after publishing to GitHub)
+## Install permanently from GitHub
 
 ```
 /plugin marketplace add taibaran/gemini-plugin-cc
-/plugin install gemini@<marketplace-name>
+/plugin install gemini@gemini-plugin-cc
 /reload-plugins
 ```
+
+The repo's `.claude-plugin/marketplace.json` declares this as a single-plugin
+marketplace named `gemini-plugin-cc`, hence the `gemini@gemini-plugin-cc`
+reference above. The first command pulls the marketplace metadata; the second
+installs the plugin into `~/.claude/plugins/`.
 
 ## License
 

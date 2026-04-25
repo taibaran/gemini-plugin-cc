@@ -17,7 +17,7 @@
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { readConfig } from "./lib/state.mjs";
-import { which, classifyAuthBlob, geminiBaseArgs } from "./lib/gemini.mjs";
+import { which, classifyAuthBlob, geminiBaseArgs, cleanGeminiEnv } from "./lib/gemini.mjs";
 import { captureDiff } from "./lib/git.mjs";
 import { buildStopGatePrompt } from "./lib/prompts.mjs";
 
@@ -144,7 +144,8 @@ function main() {
 
   const proc = spawn("gemini", ["-p", prompt, ...geminiBaseArgs({ readOnly: true })], {
     stdio: ["pipe", "pipe", "pipe"],
-    cwd
+    cwd,
+    env: cleanGeminiEnv()
   });
 
   proc.stdin.write(diffResult.diff);

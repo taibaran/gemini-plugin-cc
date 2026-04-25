@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.5 — Marketplace manifest + env scrubbing
+
+Closes the two issues a real install attempt surfaced:
+
+- **`.claude-plugin/marketplace.json` added.** Without it, the install
+  path advertised in the README (`/plugin marketplace add` →
+  `/plugin install`) fails because Claude Code has no marketplace
+  metadata to register. The new manifest declares this repo as a
+  single-plugin marketplace named `gemini-plugin-cc` containing the
+  plugin `gemini`. The README now spells out the exact install
+  invocation: `/plugin install gemini@gemini-plugin-cc`.
+
+- **Spawned `gemini` process gets a curated environment.**
+  `lib/gemini.mjs:cleanGeminiEnv()` returns an allowlisted subset of
+  env vars and is now passed to every `spawn`/`spawnSync` call that
+  starts `gemini` (cmdAsk, runJob, authProbe, geminiVersion, the
+  stop-review-gate hook). The allowlist covers exactly what gemini
+  needs: `PATH`, `HOME`, `USER`, locale, terminal, temp dirs,
+  XDG state dirs, Gemini/Google auth env vars, and proxy settings.
+  Everything else — `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`,
+  `OPENAI_API_KEY`, `AWS_*`, `SSH_AUTH_SOCK`, npm internals,
+  arbitrary user secrets — is dropped. This narrows the blast radius
+  if `@google/gemini-cli` (or any of its deps) is ever compromised by
+  a supply-chain attack: the process still works, but secrets
+  unrelated to its task no longer travel with it. Verified the
+  existing OAuth flow still authenticates after scrubbing — gemini's
+  config under `~/.gemini` is reachable via `HOME` alone.
+
 ## 0.4.4 — Refactor + ANSI/OSC sanitization
 
 Closes the two follow-ups left over from v0.4.3 — the duplicated job-running

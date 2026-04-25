@@ -18,7 +18,8 @@ import { isAlive, terminateProcessTree } from "./lib/process.mjs";
 import { captureDiff } from "./lib/git.mjs";
 import {
   which, geminiVersion, authProbe, classifyAuthBlob,
-  detectAuthSource, geminiBaseArgs, effectiveModel, DEFAULT_MODEL
+  detectAuthSource, geminiBaseArgs, effectiveModel, DEFAULT_MODEL,
+  cleanGeminiEnv
 } from "./lib/gemini.mjs";
 import { buildReviewPrompt } from "./lib/prompts.mjs";
 import { renderJobTable, renderJobDetails, fmtTime, TerminalSanitizer, sanitizeForTerminal } from "./lib/render.mjs";
@@ -123,7 +124,7 @@ function cmdAsk({ flags, positional }) {
     process.exit(127);
   }
   const args = ["-p", prompt, ...geminiBaseArgs({ readOnly: true, model: flags.model })];
-  const r = spawnSync("gemini", args, { encoding: "utf8" });
+  const r = spawnSync("gemini", args, { encoding: "utf8", env: cleanGeminiEnv() });
   process.stdout.write(sanitizeForTerminal(r.stdout || ""));
   if (r.status !== 0) {
     if (r.stderr) process.stderr.write(sanitizeForTerminal(r.stderr));
@@ -155,7 +156,7 @@ function runJob({ args, meta, stdin = null, showStdout = true }) {
       ? ["pipe", "pipe", "pipe"]
       : ["ignore", "pipe", "pipe"];
 
-    const proc = spawn("gemini", args, { stdio, detached: true });
+    const proc = spawn("gemini", args, { stdio, detached: true, env: cleanGeminiEnv() });
     meta.pid = proc.pid;
     writeJobMeta(meta.id, meta);
     pruneJobs();
