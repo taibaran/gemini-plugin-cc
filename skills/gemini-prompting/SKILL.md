@@ -38,10 +38,9 @@ A good rescue prompt for Gemini is short, direct, and grounded:
 - Don't include Claude-internal context like prior tool outputs or scratch notes.
 - Don't pre-decide the fix. Let Gemini propose its own approach.
 
-## Effort and model selection
+## Model selection
 
-- **Effort** — only set `--effort` when the user explicitly asks for it. Gemini's default reasoning is usually appropriate.
-- **Model** — only set `--model` when the user names one (e.g., `gemini-2.5-pro`). Otherwise, the CLI's default is fine.
+- **Model** — only set `--model` when the user names one (e.g., `gemini-2.5-pro`). Otherwise leave it unset; the plugin's `lib/gemini.mjs:DEFAULT_MODEL` (currently `gemini-3.1-pro-preview`) is what every call defaults to. Do not assume "the CLI default" — the plugin pins the model on every invocation, so consistency comes from there, not from the CLI.
 
 ## When NOT to rephrase
 

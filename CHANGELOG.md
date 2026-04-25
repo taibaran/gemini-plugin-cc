@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.4.3 — Bug-fix pass after dual Codex+Gemini review
+
+Both Codex (via `codex:codex-rescue`) and Gemini (via this plugin's own
+`task` runtime, dogfooded) produced independent reviews and converged on
+the same top-3 high-impact bugs. This release fixes those plus a handful
+of P1s caught by one or the other:
+
+- **Cancel race fixed.** `terminateProcessTree` now returns a Promise that
+  resolves only after the SIGKILL escalation step. `killJob` is async and
+  awaited from `cmdCancel`; previously `process.exit(0)` was called
+  synchronously after scheduling SIGKILL via `setTimeout`, so a Gemini
+  process that ignored SIGTERM survived as an orphan while the job state
+  was written as "cancelled". Also: `killJob` now writes the cancelled
+  status BEFORE the kill so the close handler does not race-overwrite it
+  with "failed". (`scripts/lib/process.mjs`, `scripts/companion.mjs`)
+- **Review jobs now spawn detached.** `cmdReview` was missing
+  `detached: true`, which made `process.kill(-pid)` fail with ESRCH on
+  cancellation and orphan any grandchildren the Gemini CLI spawned. Now
+  matches `cmdTask`. (`scripts/companion.mjs`)
+- **JSON schema-mismatch fallback emits unwrapped payload.** When
+  `validateReviewSchemaShallow` rejected Gemini's output, the previous
+  code wrote the raw CLI wrapper `{ session_id, response, stats }` to
+  stdout — guaranteed to break any downstream consumer that expected
+  the review schema. Now writes the unwrapped `parsed` object. Also: the
+  JSON path re-reads the full stdout from disk before parsing, so a
+  payload near the in-memory 256KB cap no longer corrupts the parse.
+  (`scripts/companion.mjs`)
+- **Branch-review base errors now hard-fail.** A typo in `--base <ref>`
+  used to silently produce a clean-review message. `cmdReview` now
+  surfaces `no-base` and `bad-ref` as exit-2 errors with actionable
+  messages. (`scripts/companion.mjs`)
+- **`/gemini:result` confines log reads to the jobs directory.**
+  New `safeJobLogPath()` helper rejects any `stdout_path`/`stderr_path`
+  that resolves outside the workspace's jobs dir. Defense-in-depth
+  against tampered job metadata.
+- **`isAlive` distinguishes EPERM from ESRCH.** A process owned by a
+  different uid no longer registers as dead, so the session-lifecycle
+  hook stops reaping legitimate jobs in shared-fs setups.
+  (`scripts/lib/process.mjs`)
+- **Stop-review-gate hook caps its buffers.** Previously
+  `stop-review-gate-hook.mjs` accumulated Gemini's stdout/stderr without
+  a cap inside a 12-minute window — a runaway Gemini process could OOM
+  the hook. Now capped at 256KB per stream.
+- **Setup auth source no longer lies on failure.** `detectAuthSource()`
+  used to claim `settings.json (oauth)` as a default whenever no env
+  vars were set, even when no auth was configured at all. The setup
+  output now omits the source when the probe fails.
+- **Removed dead/misleading flags.** `--effort` and `--timeout-ms` were
+  parsed but never forwarded to Gemini. Removed from `COMMON_VALUE_FLAGS`
+  along with the corresponding paragraph in `gemini-prompting/SKILL.md`.
+  Also removed `lastTurnDiff()` (exported but unused).
+- **Quoting fix in `commands/setup.md`.** Was the only command file with
+  unquoted `$ARGUMENTS`; brought into line with the others.
+- **Argument hints updated.** `/gemini:review` now lists `--json` and
+  `--wait`/`--background`; `/gemini:adversarial-review` now lists
+  `staged`/`unstaged` scopes and `--wait`/`--background`.
+- **Skill doc model guidance corrected.** `gemini-prompting/SKILL.md`
+  used to tell rescue subagents "the CLI's default is fine" for model
+  selection. The plugin actually pins `gemini-3.1-pro-preview` on every
+  call. Updated to match reality.
+
 ## 0.4.2 — Broaden rescue agent's proactive trigger
 
 - `agents/gemini-rescue.md` description now explicitly names long-form

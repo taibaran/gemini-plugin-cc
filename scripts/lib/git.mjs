@@ -41,7 +41,12 @@ export function captureDiff({ scope, base, cwd } = {}) {
   if (scope === "branch") {
     const ref = base || guessBaseRef(cwd);
     if (!ref) return { kind: "no-base", diff: "" };
-    if (!isValidGitRef(ref)) return { kind: "bad-ref", diff: "" };
+    if (!isValidGitRef(ref)) return { kind: "bad-ref", diff: "", base: ref };
+    // Verify the ref actually resolves before diffing. Without this, a typo
+    // like `--base mian` produces an empty diff and the caller cannot tell
+    // it apart from a clean branch.
+    const verify = spawnSync("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { encoding: "utf8", cwd });
+    if (verify.status !== 0) return { kind: "bad-ref", diff: "", base: ref };
     // `--` separates options from refspecs so a ref that somehow slipped past
     // our regex still can't be parsed as an option.
     const r = spawnSync("git", ["diff", "--", `${ref}...HEAD`], { encoding: "utf8", cwd });
@@ -66,9 +71,3 @@ export function captureDiff({ scope, base, cwd } = {}) {
   return { kind: "working-tree", diff: truncateDiff(cached + unstaged) };
 }
 
-// For the stop-review-gate: find files edited in the last commit window.
-// We use git status + diff against HEAD as a proxy.
-export function lastTurnDiff(cwd) {
-  const r = captureDiff({ scope: "auto", cwd });
-  return r.diff || "";
-}

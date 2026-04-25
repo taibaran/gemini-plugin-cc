@@ -1,6 +1,6 @@
 ---
 description: Run a Gemini code review against local git state
-argument-hint: '[--base <ref>] [--scope auto|working-tree|branch|staged|unstaged] [--model <model>] [focus ...]'
+argument-hint: '[--base <ref>] [--scope auto|working-tree|branch|staged|unstaged] [--model <model>] [--json] [--wait|--background] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---

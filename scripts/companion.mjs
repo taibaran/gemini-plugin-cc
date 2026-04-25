@@ -67,10 +67,13 @@ function cmdSetup({ flags }) {
   }
 
   if (gemBin) {
-    result.auth.source = detectAuthSource();
     const probe = authProbe();
     result.auth.available = probe.ok;
     result.auth.detail = probe.detail;
+    // Only claim a specific source when auth actually works. Otherwise
+    // detectAuthSource() returns "settings.json (oauth)" as a fallback,
+    // which falsely implies oauth is configured when nothing is.
+    result.auth.source = probe.ok ? detectAuthSource() : null;
     if (!probe.ok) {
       result.nextSteps.push(
         "Authenticate Gemini. Either:\n  • Run `!gemini` once and complete the Google OAuth flow, OR\n  • Set GEMINI_API_KEY (free key from https://aistudio.google.com/app/apikey)."
@@ -94,7 +97,7 @@ function cmdSetup({ flags }) {
     console.log(`Node:         ${result.node.detail}`);
     console.log(`npm:          ${result.npm.available ? result.npm.detail : "missing"}`);
     console.log(`Gemini:       ${result.gemini.detail}`);
-    console.log(`Auth:         ${result.auth.available ? "✅ working" : "❌ " + result.auth.detail} (${result.auth.source})`);
+    console.log(`Auth:         ${result.auth.available ? "✅ working" : "❌ " + result.auth.detail}${result.auth.source ? ` (${result.auth.source})` : ""}`);
     console.log(`Model:        ${result.model.active}${result.model.override ? "  (via GEMINI_PLUGIN_MODEL)" : "  (plugin default)"}`);
     console.log(`Review gate:  ${result.reviewGateEnabled ? "enabled" : "disabled"}`);
     if (result.nextSteps.length) {
@@ -160,6 +163,14 @@ function cmdReview({ flags, positional }, { adversarial }) {
     console.log("Not inside a git repository — nothing to review.");
     process.exit(0);
   }
+  if (diffResult.kind === "no-base") {
+    console.error("Branch review needs a base ref. Pass --base <ref> (no origin/main, origin/master, main, or master found).");
+    process.exit(2);
+  }
+  if (diffResult.kind === "bad-ref") {
+    console.error(`Invalid git ref for --base: ${base}`);
+    process.exit(2);
+  }
   if (!diffResult.diff.trim()) {
     console.log(`Nothing to review (scope: ${diffResult.kind}${diffResult.base ? `, base: ${diffResult.base}` : ""}).`);
     process.exit(0);
@@ -195,7 +206,7 @@ function cmdReview({ flags, positional }, { adversarial }) {
   const stdoutFd = fs.openSync(stdoutPath, "w");
   const stderrFd = fs.openSync(stderrPath, "w");
 
-  const proc = spawn("gemini", args, { stdio: ["pipe", "pipe", "pipe"] });
+  const proc = spawn("gemini", args, { stdio: ["pipe", "pipe", "pipe"], detached: true });
   meta.pid = proc.pid;
   writeJobMeta(jobId, meta);
   pruneJobs();
@@ -237,22 +248,31 @@ function cmdReview({ flags, positional }, { adversarial }) {
     if (jsonOutput) {
       // Gemini's `-o json` returns: { session_id, response, stats }.
       // Strip the wrapper, strip markdown fences, validate shallow shape,
-      // then emit clean JSON.
+      // then emit clean JSON. Re-read the full stdout file from disk —
+      // outBuf is capped at MAX_BUF and a JSON payload near or past that
+      // cap would be corrupted as a parse target. The on-disk file has
+      // no cap.
+      let fullOut;
+      try { fullOut = fs.readFileSync(stdoutPath, "utf8"); } catch { fullOut = outBuf; }
       try {
-        const wrapper = JSON.parse(outBuf);
+        const wrapper = JSON.parse(fullOut);
         let inner = (wrapper.response ?? "").trim();
         const fenced = inner.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
         if (fenced) inner = fenced[1].trim();
         const parsed = JSON.parse(inner);
         const why = validateReviewSchemaShallow(parsed);
         if (why) {
-          process.stderr.write(`[gemini-plugin] review --json: schema mismatch (${why}). Returning raw output.\n`);
-          process.stdout.write(outBuf);
+          // Schema mismatch: still emit the unwrapped payload (not the
+          // CLI wrapper). The wrapper is { session_id, response, stats }
+          // and is never what a downstream JSON consumer wants.
+          process.stderr.write(`[gemini-plugin] review --json: schema mismatch (${why}). Returning unwrapped payload.\n`);
+          process.stdout.write(JSON.stringify(parsed, null, 2) + "\n");
         } else {
           process.stdout.write(JSON.stringify(parsed, null, 2) + "\n");
         }
       } catch {
-        process.stdout.write(outBuf);
+        // Could not parse as JSON wrapper at all — emit whatever we have.
+        process.stdout.write(fullOut);
       }
     }
     process.exit(0);
@@ -395,6 +415,18 @@ function cmdStatus({ flags, positional }) {
 
 // ---------- subcommand: result ----------
 
+// Confine log-file reads to the jobs directory. Job metadata is JSON we wrote
+// ourselves, but the file can be tampered with on disk by anything that has
+// write access to ${CLAUDE_PLUGIN_DATA}. Without confinement, a manipulated
+// stdout_path could make /gemini:result read any user-readable file.
+function safeJobLogPath(p) {
+  if (typeof p !== "string" || !p) return null;
+  const dir = path.resolve(jobsDir());
+  const resolved = path.resolve(p);
+  if (path.dirname(resolved) !== dir) return null;
+  return resolved;
+}
+
 function cmdResult({ positional }) {
   const target = positional[0];
   let meta;
@@ -419,18 +451,26 @@ function cmdResult({ positional }) {
   console.log(`Started: ${fmtTime(meta.started_at)}${meta.ended_at ? `   Ended: ${fmtTime(meta.ended_at)}` : ""}`);
   if (meta.exit_code !== undefined) console.log(`Exit: ${meta.exit_code}`);
   console.log("\n## Output\n");
-  try {
-    const out = fs.readFileSync(meta.stdout_path, "utf8");
-    process.stdout.write(out || "(no output)\n");
-  } catch (e) {
-    console.log(`(could not read stdout: ${e.message})`);
+  const safeOut = safeJobLogPath(meta.stdout_path);
+  if (!safeOut) {
+    console.log("(stdout path is outside the jobs directory — refusing to read)");
+  } else {
+    try {
+      const out = fs.readFileSync(safeOut, "utf8");
+      process.stdout.write(out || "(no output)\n");
+    } catch (e) {
+      console.log(`(could not read stdout: ${e.message})`);
+    }
   }
   if (meta.exit_code && meta.exit_code !== 0) {
     console.log("\n## Errors\n");
-    try {
-      const err = fs.readFileSync(meta.stderr_path, "utf8");
-      process.stdout.write(err);
-    } catch {}
+    const safeErr = safeJobLogPath(meta.stderr_path);
+    if (safeErr) {
+      try {
+        const err = fs.readFileSync(safeErr, "utf8");
+        process.stdout.write(err);
+      } catch {}
+    }
   }
   console.log(`\n---\nFollow-up: /gemini:status ${meta.id}`);
   process.exit(0);
@@ -438,14 +478,20 @@ function cmdResult({ positional }) {
 
 // ---------- subcommand: cancel ----------
 
-function killJob(meta) {
-  terminateProcessTree(meta.pid);
+// Mark cancelled BEFORE the SIGTERM/SIGKILL escalation so the close handler
+// in cmdReview/cmdTask sees `status: "cancelled"` and does not overwrite it
+// with "failed" when the process exits non-zero. Then await the kill-tree
+// promise so SIGKILL has a chance to fire — if we exited synchronously,
+// the setTimeout for SIGKILL would be cleared by process.exit and a Gemini
+// process that ignores SIGTERM would survive.
+async function killJob(meta) {
   meta.status = "cancelled";
   meta.ended_at = new Date().toISOString();
   writeJobMeta(meta.id, meta);
+  await terminateProcessTree(meta.pid);
 }
 
-function cmdCancel({ positional }) {
+async function cmdCancel({ positional }) {
   const target = positional[0];
   if (!target) {
     const running = listJobs().filter(j => j.status === "running" && isAlive(j.pid));
@@ -453,7 +499,7 @@ function cmdCancel({ positional }) {
       console.log("No running Gemini jobs to cancel.");
       process.exit(0);
     }
-    for (const j of running) killJob(j);
+    await Promise.all(running.map(j => killJob(j)));
     console.log(`Cancelled ${running.length} job(s).`);
     process.exit(0);
   }
@@ -463,7 +509,7 @@ function cmdCancel({ positional }) {
     console.log(`Job ${meta.id} is not running (status: ${meta.status}). Nothing to cancel.`);
     process.exit(0);
   }
-  killJob(meta);
+  await killJob(meta);
   console.log(`Cancelled ${meta.id}.`);
   process.exit(0);
 }

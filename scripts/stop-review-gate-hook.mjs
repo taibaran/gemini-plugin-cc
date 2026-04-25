@@ -137,6 +137,11 @@ function main() {
   let errBuf = "";
   let timedOut = false;
 
+  // Hard cap on hook buffers. The verdict JSON is tiny — a runaway Gemini
+  // process emitting GBs of output during the 12-min hook window would
+  // otherwise OOM Node and kill the Stop hook entirely.
+  const MAX_HOOK_BUF = 256 * 1024;
+
   const proc = spawn("gemini", ["-p", prompt, ...geminiBaseArgs({ readOnly: true })], {
     stdio: ["pipe", "pipe", "pipe"],
     cwd
@@ -145,8 +150,16 @@ function main() {
   proc.stdin.write(diffResult.diff);
   proc.stdin.end();
 
-  proc.stdout.on("data", d => { outBuf += d.toString(); });
-  proc.stderr.on("data", d => { errBuf += d.toString(); });
+  proc.stdout.on("data", d => {
+    if (outBuf.length < MAX_HOOK_BUF) {
+      outBuf += d.toString().slice(0, MAX_HOOK_BUF - outBuf.length);
+    }
+  });
+  proc.stderr.on("data", d => {
+    if (errBuf.length < MAX_HOOK_BUF) {
+      errBuf += d.toString().slice(0, MAX_HOOK_BUF - errBuf.length);
+    }
+  });
 
   const timer = setTimeout(() => {
     timedOut = true;
