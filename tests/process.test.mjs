@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isValidPid, isAlive } from "../scripts/lib/process.mjs";
+import { isValidPid, isAlive } from "../plugins/gemini/scripts/lib/process.mjs";
 
 test("isValidPid: accepts positive integers > 1", () => {
   assert.equal(isValidPid(2), true);

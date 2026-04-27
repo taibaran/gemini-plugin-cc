@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.5.3 — Restructure to plugins/gemini/ subdirectory (fix marketplace install)
+
+Real install attempt surfaced a marketplace-schema validation error:
+
+```
+Failed to parse marketplace file: plugins.0.source: Invalid input
+```
+
+Claude Code's marketplace schema requires `plugins[].source` to be a path
+to a subdirectory containing `.claude-plugin/plugin.json`, not the literal
+`"."` we shipped in 0.4.5–0.5.2. The reference is `openai/codex-plugin-cc`,
+which uses `"./plugins/codex"`.
+
+This release restructures the repo to mirror that convention:
+
+```
+gemini-plugin-cc/
+├── .claude-plugin/marketplace.json   ← marketplace metadata at repo root
+└── plugins/gemini/
+    ├── .claude-plugin/plugin.json    ← plugin manifest
+    ├── agents/  commands/  hooks/
+    ├── prompts/  schemas/  scripts/
+    └── skills/
+```
+
+`marketplace.json` now has `"source": "./plugins/gemini"`. The plugin
+itself is unchanged — same code, same companion.mjs, same slash commands.
+Only the on-disk layout moved.
+
+### What this fixes
+
+- `/plugin marketplace add https://github.com/taibaran/gemini-plugin-cc`
+  now passes schema validation. Followed by `/plugin install
+  gemini@gemini-plugin-cc`, the plugin actually installs into
+  `~/.claude/plugins/`.
+- README's architecture diagram and `--plugin-dir` example are updated
+  to match (`--plugin-dir ./gemini-plugin-cc/plugins/gemini`).
+- CI workflow paths updated to point at `plugins/gemini/scripts/`.
+- Test imports updated to `../plugins/gemini/scripts/lib/...`. 85/85
+  pass after the restructure.
+
+### What did NOT change
+
+- Slash commands and their behavior (still 9 commands).
+- `${CLAUDE_PLUGIN_ROOT}` resolves to wherever Claude Code installs the
+  plugin, so command files that reference `${CLAUDE_PLUGIN_ROOT}/scripts/...`
+  keep working without edit.
+- Public API of every module.
+- Test count (85) and behavior.
+
 ## 0.5.2 — Fix CI smoke test + cmdTask check order
 
 Two bugs surfaced when the v0.5.1 CI run failed on a runner without

@@ -16,7 +16,7 @@ import {
   setReviewGate,
   readConfig,
   setActiveModel
-} from "../scripts/lib/state.mjs";
+} from "../plugins/gemini/scripts/lib/state.mjs";
 
 // Each test gets a fresh CLAUDE_PLUGIN_DATA so state writes are isolated.
 function freshDataDir() {
@@ -165,7 +165,7 @@ test("cmdTask: --write refusal fires BEFORE the gemini-not-installed check", asy
   const path = await import("node:path");
   const url = await import("node:url");
   const here = path.dirname(url.fileURLToPath(import.meta.url));
-  const companion = path.resolve(here, "../scripts/companion.mjs");
+  const companion = path.resolve(here, "../plugins/gemini/scripts/companion.mjs");
 
   const r = spawnSync(process.execPath, [companion, "task", "--write", "anything"], {
     encoding: "utf8",

@@ -8,7 +8,7 @@ import {
   effectiveModel,
   DEFAULT_MODEL,
   MIN_GEMINI_VERSION
-} from "../scripts/lib/gemini.mjs";
+} from "../plugins/gemini/scripts/lib/gemini.mjs";
 
 test("cleanGeminiEnv: drops Anthropic / GitHub / OpenAI / AWS / SSH secrets", () => {
   const fake = {
@@ -139,7 +139,7 @@ test("effectiveModel: honors caller arg, then env, then workspace config, then d
   delete process.env.GEMINI_PLUGIN_MODEL;
 
   // Config wins over default when env is unset.
-  const { setActiveModel } = await import("../scripts/lib/state.mjs");
+  const { setActiveModel } = await import("../plugins/gemini/scripts/lib/state.mjs");
   setActiveModel(tmpData, "config-model");
   assert.equal(effectiveModel(undefined, tmpData), "config-model");
 

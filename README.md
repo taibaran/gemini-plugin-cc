@@ -20,18 +20,34 @@ Claude Code plugin that lets you call Google's Gemini from inside a Claude Code 
 
 ```
 gemini-plugin-cc/
-├── .claude-plugin/plugin.json     ← manifest (name, version, author)
-├── agents/
-│   └── gemini-rescue.md           ← thin forwarding subagent for /gemini:rescue
-├── commands/                      ← slash command frontmatter + Claude instructions
-│   ├── setup.md  ask.md  review.md
-│   ├── adversarial-review.md  rescue.md
-│   └── status.md  result.md  cancel.md
-└── scripts/
-    └── companion.mjs              ← single Node entrypoint, all subcommands
+├── .claude-plugin/
+│   └── marketplace.json          ← marketplace metadata (this repo as a marketplace)
+├── plugins/
+│   └── gemini/                    ← the actual plugin (referenced by marketplace.json source)
+│       ├── .claude-plugin/
+│       │   └── plugin.json        ← plugin manifest
+│       ├── agents/
+│       │   └── gemini-rescue.md   ← thin forwarding subagent for /gemini:rescue
+│       ├── commands/              ← slash command frontmatter + Claude instructions
+│       ├── hooks/                 ← session-lifecycle + stop-review-gate hooks
+│       ├── prompts/               ← review and adversarial-review prompt templates
+│       ├── schemas/               ← review JSON schema
+│       ├── scripts/
+│       │   └── companion.mjs      ← single Node entrypoint, all subcommands
+│       └── skills/                ← runtime + prompting skills consumed by gemini-rescue
+├── tests/                         ← unit tests (node:test, no devDeps)
+├── .github/workflows/             ← CI matrix Node 20/22 + smoke job
+├── package.json
+├── README.md
+├── CHANGELOG.md
+└── LICENSE
 ```
 
-All slash commands invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/companion.mjs" <subcommand>`. The companion handles:
+The two-level layout (marketplace at repo root, plugin in `plugins/gemini/`)
+mirrors the convention used by `openai/codex-plugin-cc` and is what Claude
+Code's marketplace schema expects.
+
+All slash commands invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/companion.mjs" <subcommand>`. `${CLAUDE_PLUGIN_ROOT}` resolves to wherever the plugin is installed (`~/.claude/plugins/<plugin-id>/`), so the path stays consistent across local-dev and installed setups. The companion handles:
 
 - subprocess management of the `gemini` CLI
 - diff capture (working-tree / staged / branch)
@@ -62,8 +78,11 @@ By default the plugin pins every Gemini invocation to `gemini-3.1-pro-preview`
 
 ```
 git clone https://github.com/taibaran/gemini-plugin-cc.git
-claude --plugin-dir ./gemini-plugin-cc
+claude --plugin-dir ./gemini-plugin-cc/plugins/gemini
 ```
+
+Note the `/plugins/gemini` suffix — `--plugin-dir` expects the path that
+contains `.claude-plugin/plugin.json`, not the repo root.
 
 Then inside Claude Code:
 

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseArgs, splitRawArgumentString, COMMON_BOOL_FLAGS, COMMON_VALUE_FLAGS } from "../scripts/lib/args.mjs";
+import { parseArgs, splitRawArgumentString, COMMON_BOOL_FLAGS, COMMON_VALUE_FLAGS } from "../plugins/gemini/scripts/lib/args.mjs";
 
 test("splitRawArgumentString: simple tokens", () => {
   assert.deepEqual(splitRawArgumentString("a b c"), ["a", "b", "c"]);

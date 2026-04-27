@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { isValidGitRef } from "../scripts/lib/git.mjs";
+import { isValidGitRef } from "../plugins/gemini/scripts/lib/git.mjs";
 
 test("isValidGitRef: accepts simple branch names", () => {
   assert.equal(isValidGitRef("main"), true);

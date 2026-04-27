@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sanitizeForTerminal, TerminalSanitizer } from "../scripts/lib/render.mjs";
+import { sanitizeForTerminal, TerminalSanitizer } from "../plugins/gemini/scripts/lib/render.mjs";
 
 test("sanitize: plain text passthrough", () => {
   assert.equal(sanitizeForTerminal("hello world"), "hello world");

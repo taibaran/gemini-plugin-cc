@@ -24,7 +24,7 @@ jobs:
       - name: Syntax check all .mjs files
         run: |
           set -e
-          find scripts tests -name '*.mjs' -print0 | xargs -0 -n1 node --check
+          find plugins/gemini/scripts tests -name '*.mjs' -print0 | xargs -0 -n1 node --check
 
       - name: Run unit tests
         run: npm test
@@ -42,23 +42,23 @@ jobs:
       - name: Bad subcommand prints usage and exits 2
         run: |
           set +e
-          node scripts/companion.mjs nonexistent
+          node plugins/gemini/scripts/companion.mjs nonexistent
           if [ "$?" -ne 2 ]; then echo "Expected exit 2"; exit 1; fi
 
       - name: status returns successfully on empty workspace
-        run: node scripts/companion.mjs status
+        run: node plugins/gemini/scripts/companion.mjs status
 
       - name: Argument parser does not crash on edge inputs
         run: |
           set -e
-          node scripts/companion.mjs status --all
-          node scripts/companion.mjs purge --older-than 30d || true
+          node plugins/gemini/scripts/companion.mjs status --all
+          node plugins/gemini/scripts/companion.mjs purge --older-than 30d || true
 
       - name: Write mode is refused without GEMINI_PLUGIN_ALLOW_WRITE
         run: |
           set +e
           # Don't pipe — `| tee` masks node's exit code with tee's (always 0).
-          node scripts/companion.mjs task --write "test" > out.txt 2>&1
+          node plugins/gemini/scripts/companion.mjs task --write "test" > out.txt 2>&1
           rc=$?
           if [ "$rc" -ne 2 ]; then
             echo "Expected exit 2 from write refusal, got $rc"
