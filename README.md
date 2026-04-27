@@ -78,7 +78,7 @@ Then inside Claude Code:
 ## Install permanently from GitHub
 
 ```
-/plugin marketplace add taibaran/gemini-plugin-cc
+/plugin marketplace add https://github.com/taibaran/gemini-plugin-cc
 /plugin install gemini@gemini-plugin-cc
 /reload-plugins
 ```
@@ -87,6 +87,14 @@ The repo's `.claude-plugin/marketplace.json` declares this as a single-plugin
 marketplace named `gemini-plugin-cc`, hence the `gemini@gemini-plugin-cc`
 reference above. The first command pulls the marketplace metadata; the second
 installs the plugin into `~/.claude/plugins/`.
+
+The HTTPS URL form is intentional. Claude Code's shorter form
+(`/plugin marketplace add <user>/<repo>`) defaults to SSH
+(`git@github.com:...`), which fails with `Host key verification failed`
+unless `github.com` is already in `~/.ssh/known_hosts` and an SSH key is
+configured. HTTPS avoids both requirements and is the right choice for any
+public repo. If you saw the SSH error, run the command above with
+`https://` and try again.
 
 ## Privacy & security
 
