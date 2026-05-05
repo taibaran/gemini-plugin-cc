@@ -195,12 +195,70 @@ export function writeConfig(cwd, config) {
   atomicWrite(configFile(cwd), JSON.stringify(config, null, 2));
 }
 
+// Cross-process lock around config.json read-modify-write. atomicWrite makes
+// the file replacement atomic, but the read+modify+write pattern in
+// setReviewGate / setActiveModel is not — two concurrent callers can both
+// read the same starting state and the second write silently overwrites
+// the first's update. The lock funnels them through one at a time.
+//
+// Implementation notes:
+//   - O_EXCL via "wx" gives us a primitive `try-acquire`.
+//   - Stale locks (>30s old, >100x the worst-case operation time) are
+//     reclaimed automatically so a SIGKILL'd caller doesn't strand the lock.
+//   - Atomics.wait gives a real synchronous sleep without busy-waiting,
+//     which we need because setReviewGate / setActiveModel are sync.
+const CONFIG_LOCK_TIMEOUT_MS = 5000;
+const CONFIG_LOCK_STALE_MS = 30_000;
+const CONFIG_LOCK_POLL_MS = 25;
+
+function sleepSync(ms) {
+  // Atomics.wait blocks the thread without spinning. The shared array
+  // never changes, so wait always returns "timed-out" after `ms`.
+  const sab = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
+
+function withConfigLock(cwd, fn) {
+  const dir = stateDir(cwd);
+  ensureDir(dir);
+  const lockPath = path.join(dir, CONFIG_FILE_NAME + ".lock");
+  const start = Date.now();
+  let fd = null;
+  while (Date.now() - start < CONFIG_LOCK_TIMEOUT_MS) {
+    try {
+      fd = fs.openSync(lockPath, "wx", 0o600);
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      try {
+        const lstat = fs.statSync(lockPath);
+        if (Date.now() - lstat.mtimeMs > CONFIG_LOCK_STALE_MS) {
+          fs.unlinkSync(lockPath);
+          continue;
+        }
+      } catch {}
+      sleepSync(CONFIG_LOCK_POLL_MS);
+    }
+  }
+  if (fd === null) {
+    throw new Error(`config.json lock acquisition timeout: ${lockPath}`);
+  }
+  try {
+    return fn();
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+    try { fs.unlinkSync(lockPath); } catch {}
+  }
+}
+
 export function setReviewGate(cwd, enabled) {
-  const c = readConfig(cwd);
-  c.reviewGateEnabled = !!enabled;
-  c.version = STATE_VERSION;
-  writeConfig(cwd, c);
-  return c;
+  return withConfigLock(cwd, () => {
+    const c = readConfig(cwd);
+    c.reviewGateEnabled = !!enabled;
+    c.version = STATE_VERSION;
+    writeConfig(cwd, c);
+    return c;
+  });
 }
 
 // Persist the model that setup's fallback chain landed on, so subsequent
@@ -210,16 +268,18 @@ export function setReviewGate(cwd, enabled) {
 // arbitrary strings written by a hostile config tamper.
 const MODEL_ID_PATTERN = /^[a-zA-Z0-9._-]{1,64}$/;
 export function setActiveModel(cwd, model) {
-  const c = readConfig(cwd);
-  if (model === null || model === undefined) {
-    delete c.activeModel;
-  } else {
-    if (typeof model !== "string" || !MODEL_ID_PATTERN.test(model)) {
-      throw new Error(`invalid model id: ${String(model).slice(0, 64)}`);
+  return withConfigLock(cwd, () => {
+    const c = readConfig(cwd);
+    if (model === null || model === undefined) {
+      delete c.activeModel;
+    } else {
+      if (typeof model !== "string" || !MODEL_ID_PATTERN.test(model)) {
+        throw new Error(`invalid model id: ${String(model).slice(0, 64)}`);
+      }
+      c.activeModel = model;
     }
-    c.activeModel = model;
-  }
-  c.version = STATE_VERSION;
-  writeConfig(cwd, c);
-  return c;
+    c.version = STATE_VERSION;
+    writeConfig(cwd, c);
+    return c;
+  });
 }

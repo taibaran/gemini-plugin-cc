@@ -21,6 +21,7 @@ import { which, classifyAuthBlob, geminiBaseArgs, cleanGeminiEnv } from "./lib/g
 import { captureDiff } from "./lib/git.mjs";
 import { buildStopGatePrompt } from "./lib/prompts.mjs";
 import { parseVerdict } from "./lib/verdict.mjs";
+import { terminateProcessTree } from "./lib/process.mjs";
 
 const HOOK_TIMEOUT_MS = 12 * 60 * 1000;
 
@@ -111,9 +112,19 @@ function main() {
 
   const proc = spawn("gemini", ["-p", prompt, ...geminiBaseArgs({ readOnly: true })], {
     stdio: ["pipe", "pipe", "pipe"],
+    // detached=true gives the child its own process group so we can SIGTERM
+    // it (and any descendants gemini spawned) via terminateProcessTree
+    // without also killing this hook script. Without this flag, kill(-pid)
+    // would target our own group and tear down the hook before it could
+    // emit a verdict.
+    detached: true,
     cwd,
     env: cleanGeminiEnv()
   });
+
+  // Without this, an EPIPE on stdin (gemini exits before reading the diff)
+  // crashes the hook entirely. Same hardening as runJob in companion.mjs.
+  proc.stdin.on("error", () => {});
 
   proc.stdin.write(diffResult.diff);
   proc.stdin.end();
@@ -131,7 +142,12 @@ function main() {
 
   const timer = setTimeout(() => {
     timedOut = true;
-    try { proc.kill("SIGTERM"); } catch {}
+    // SIGTERM the process group, escalate to SIGKILL after the grace window.
+    // Previous version called proc.kill("SIGTERM") which targets only the
+    // direct child — any subprocesses gemini spawned (auth helpers,
+    // language-server-like sidecars) survived as orphans, and a child
+    // ignoring SIGTERM never escalated. terminateProcessTree handles both.
+    terminateProcessTree(proc.pid).catch(() => {});
   }, HOOK_TIMEOUT_MS);
 
   proc.on("close", code => {

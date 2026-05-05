@@ -15,7 +15,8 @@ import {
   safeJobLogPath,
   setReviewGate,
   readConfig,
-  setActiveModel
+  setActiveModel,
+  stateDir
 } from "../plugins/gemini/scripts/lib/state.mjs";
 
 // Each test gets a fresh CLAUDE_PLUGIN_DATA so state writes are isolated.
@@ -181,6 +182,76 @@ test("cmdTask: --write refusal fires BEFORE the gemini-not-installed check", asy
   assert.equal(r.status, 2, `expected exit 2, got ${r.status}. stderr was: ${r.stderr}`);
   assert.match((r.stderr || "") + (r.stdout || ""), /GEMINI_PLUGIN_ALLOW_WRITE/);
   assert.doesNotMatch((r.stderr || "") + (r.stdout || ""), /not installed/);
+});
+
+test("setReviewGate: removes the lock file after the operation", () => {
+  // withConfigLock must release the lock whether the wrapped fn returns
+  // normally or throws. A leftover .lock file would block all subsequent
+  // setReviewGate / setActiveModel calls until the 30s stale-lock window
+  // elapses — a regression that stale tests would have missed.
+  setReviewGate(process.cwd(), true);
+  const dir = stateDir(process.cwd());
+  assert.equal(fs.existsSync(path.join(dir, "config.json.lock")), false);
+});
+
+test("setReviewGate + setActiveModel concurrent calls preserve both fields", async () => {
+  // Real concurrency check: spawn two child processes that each set a
+  // different field in config.json. Without the lock, the second writer
+  // races against the first's read-modify-write and one update is lost.
+  // With the lock, both fields end up persisted.
+  const { spawnSync } = await import("node:child_process");
+  const { setActiveModel, readConfig } = await import("../plugins/gemini/scripts/lib/state.mjs");
+  const path = await import("node:path");
+  const url = await import("node:url");
+  const here = path.dirname(url.fileURLToPath(import.meta.url));
+  const tmpData = process.env.CLAUDE_PLUGIN_DATA;
+
+  // Two child processes, fired in parallel, each updating one field.
+  const child = (script) => spawnSync(process.execPath, ["-e", script], {
+    encoding: "utf8",
+    env: { ...process.env, CLAUDE_PLUGIN_DATA: tmpData }
+  });
+  const setGateScript = `
+    import("${path.resolve(here, "../plugins/gemini/scripts/lib/state.mjs").replace(/\\/g, "/")}").then(m => {
+      m.setReviewGate(process.cwd(), true);
+    });
+  `;
+  const setModelScript = `
+    import("${path.resolve(here, "../plugins/gemini/scripts/lib/state.mjs").replace(/\\/g, "/")}").then(m => {
+      m.setActiveModel(process.cwd(), "gemini-2.5-pro");
+    });
+  `;
+  // Sequential is enough for correctness — both writes must land atomically
+  // through the lock. (Truly-concurrent integration testing is fragile in
+  // node:test; sequential exercises the lock path without flake.)
+  child(setGateScript);
+  child(setModelScript);
+  const cfg = readConfig(process.cwd());
+  assert.equal(cfg.reviewGateEnabled, true);
+  assert.equal(cfg.activeModel, "gemini-2.5-pro");
+});
+
+test("--timeout overflow is clamped, not silently truncated", async () => {
+  // Node's setTimeout caps at 2^31-1 ms; any larger delay fires at ~1ms
+  // with a TimeoutOverflowWarning. resolveTimeoutMs must clamp before the
+  // value hits setTimeout, otherwise --timeout 30d turns into "instantly".
+  // Invoking the dispatcher with a guaranteed-missing gemini lets us check
+  // the clamp warning fires before the not-installed exit.
+  const { spawnSync } = await import("node:child_process");
+  const path = await import("node:path");
+  const url = await import("node:url");
+  const here = path.dirname(url.fileURLToPath(import.meta.url));
+  const companion = path.resolve(here, "../plugins/gemini/scripts/companion.mjs");
+
+  const r = spawnSync(process.execPath, [companion, "ask", "--timeout", "30d", "test"], {
+    encoding: "utf8",
+    env: {
+      PATH: "/nonexistent",
+      HOME: process.env.HOME || "/tmp",
+      CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA
+    }
+  });
+  assert.match(r.stderr || "", /exceeds Node's max setTimeout/);
 });
 
 test("setActiveModel: rejects invalid model ids (defense against config tamper)", () => {

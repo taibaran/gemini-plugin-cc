@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.5.5 — Close-out pass: every known follow-up from 0.5.3 and 0.5.4 fixed
+
+The dual Codex+Gemini re-review of v0.5.4 surfaced two regressions I
+introduced and confirmed three known-not-fixed items from the prior
+release. This release closes all five so the version is genuinely done.
+
+### Bugs introduced by 0.5.4 (now fixed)
+
+- **`setTimeout` overflow on `--timeout` ≥ 25d**. `parseDuration("30d")`
+  returns 2.59B ms, but Node's `setTimeout` silently truncates delays
+  exceeding 2³¹−1 ms to ~1 ms (and prints a `TimeoutOverflowWarning`).
+  So `--timeout 30d` would have fired immediately, mislabeling jobs as
+  timed-out before they even started. `resolveTimeoutMs` now clamps to
+  `MAX_SETTIMEOUT_MS = 2_147_483_647` and prints a stderr warning so the
+  user knows the requested duration was reduced. `cmdAsk` also clamps the
+  spawnSync `timeout` option as a defense in depth.
+- **`review --json` 8 MB fallback silently emitted truncated payload with
+  exit 0**. The over-cap path used `result.outBuf` (256 KB) as the JSON
+  source, which is itself truncated. Downstream consumers had no way to
+  distinguish a successful review from one with corrupted data. Now
+  refuses explicitly: when `stat.size > MAX_REVIEW_JSON_BYTES`, the path
+  exits with code 1 and a stderr message pointing to the full on-disk
+  log and the `/gemini:result <id>` follow-up. The fallback is no longer
+  silently lossy.
+- **Timeout-vs-close race**. The runJob timeout callback wrote
+  `status: timed-out` unconditionally; if `proc.close` and the timer
+  callback landed in the same event-loop turn, a clean exit could be
+  mislabeled. Now checks `proc.exitCode !== null || proc.signalCode !== null`
+  and bails early if so.
+
+### Known follow-ups from the 0.5.3 review (now fixed)
+
+- **`config.json` race**. `setReviewGate` and `setActiveModel` were
+  read-modify-write without locking; concurrent calls could clobber each
+  other's fields despite the atomic file replacement. New
+  `withConfigLock` helper uses `O_EXCL` lock files with stale-lock
+  recovery (>30 s) and synchronous `Atomics.wait` polling — works
+  cross-process, not just within one Node process.
+- **Lifecycle-hook cwd**. `session-lifecycle-hook.mjs` used implicit
+  `process.cwd()` while `stop-review-gate-hook.mjs` already read `cwd`
+  from the hook input JSON. Now matches: hook input JSON's `cwd` field
+  is the source of truth, with `process.cwd()` as the fallback.
+  `listJobs`, `writeJobMeta`, and `pruneJobs` all receive the resolved
+  `cwd` explicitly.
+- **Stop-hook SIGKILL escalation**. The 12-min timeout previously sent
+  only `proc.kill("SIGTERM")` to a non-detached child — a Gemini child
+  that ignored SIGTERM never escalated, and any sub-children gemini
+  spawned were orphaned. Now spawns with `detached: true` and uses
+  `terminateProcessTree` (SIGTERM the group, SIGKILL after a 2 s grace).
+  Stdin error handler added too, matching `runJob`.
+
+### UX improvement that fell out of fixing the bugs
+
+- `--timeout` validation now runs **before** the `which gemini` check in
+  both `cmdAsk` and `cmdTask`. A typo in `--timeout` is a config error
+  and should be reported as such, not masked behind a generic "not
+  installed" message. The `--write` policy gate still fires first by
+  design (policy refusals always precede environment checks).
+
+### Tests
+
+- 3 new tests bring the suite to **95 total**:
+  - `setReviewGate: removes the lock file after the operation` —
+    regression guard against a leftover `.lock` blocking subsequent
+    writers.
+  - `setReviewGate + setActiveModel concurrent calls preserve both
+    fields` — exercises the lock path through two child-process
+    invocations and asserts both updates land.
+  - `--timeout overflow is clamped, not silently truncated` —
+    dispatcher-level smoke test that invokes `companion.mjs ask
+    --timeout 30d` with `PATH=/nonexistent` and asserts the clamp
+    warning fires before the not-installed exit.
+
+### Out of scope (deliberate)
+
+- The 12-min stop-gate timeout itself is unchanged; `terminateProcessTree`
+  ensures it now actually terminates within ~14 min worst-case rather
+  than potentially hanging forever, but the duration is left as-is for
+  large-diff reviews.
+- `which gemini` still uses `spawnSync("which", ...)`. Gemini's review
+  flagged this as wasteful, but converting every call site to
+  ENOENT-on-spawn would touch five surfaces for marginal benefit.
+
 ## 0.5.4 — Robustness pass on the dual Codex+Gemini review of v0.5.3
 
 A fresh Codex+Gemini review pass on v0.5.3 produced overlapping findings.

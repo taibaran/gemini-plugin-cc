@@ -33,12 +33,22 @@ const DEFAULT_ASK_TIMEOUT_MS = 5 * 60 * 1000;       // 5 min
 const DEFAULT_REVIEW_TIMEOUT_MS = 20 * 60 * 1000;   // 20 min
 const DEFAULT_TASK_TIMEOUT_MS = 0;                  // unbounded
 
+// Node's setTimeout silently truncates delays exceeding 2^31-1 ms (~24.85d):
+// instead of waiting that long, the timer fires at ~1ms and Node prints a
+// TimeoutOverflowWarning. So `--timeout 30d` would wrap to "instantly" without
+// this clamp. The wrapper passes the cap through to spawnSync's timeout too.
+const MAX_SETTIMEOUT_MS = 2_147_483_647;
+
 function resolveTimeoutMs(rawFlag, defaultMs) {
   if (rawFlag === undefined) return defaultMs;
   const parsed = parseDuration(String(rawFlag));
   if (parsed === null) {
     console.error(`Invalid --timeout value: ${rawFlag}. Use forms like 300s, 20m, or 0 to disable.`);
     process.exit(2);
+  }
+  if (parsed > MAX_SETTIMEOUT_MS) {
+    process.stderr.write(`[gemini-plugin] --timeout ${rawFlag} exceeds Node's max setTimeout delay (${MAX_SETTIMEOUT_MS} ms ≈ 24.85d). Clamping; pass --timeout 0 to disable instead.\n`);
+    return MAX_SETTIMEOUT_MS;
   }
   return parsed;
 }
@@ -189,16 +199,20 @@ function cmdAsk({ flags, positional }) {
     console.error("Usage: ask <question>");
     process.exit(2);
   }
+  // Validate input flags before checking environment availability — a
+  // malformed --timeout is the user's typo and should be reported as such,
+  // not masked behind a "gemini not installed" failure.
+  const timeoutMs = resolveTimeoutMs(flags.timeout, DEFAULT_ASK_TIMEOUT_MS);
   if (!which("gemini")) {
     console.error("Gemini CLI not installed. Run `/gemini:setup`.");
     process.exit(127);
   }
-  const timeoutMs = resolveTimeoutMs(flags.timeout, DEFAULT_ASK_TIMEOUT_MS);
   const args = ["-p", prompt, ...geminiBaseArgs({ readOnly: true, model: flags.model })];
   const spawnOpts = { encoding: "utf8", env: cleanGeminiEnv() };
   // spawnSync's `timeout` SIGTERMs the child after the deadline; r.error.code
   // becomes ETIMEDOUT so we can distinguish a timeout from a normal failure.
-  if (timeoutMs > 0) spawnOpts.timeout = timeoutMs;
+  // Same setTimeout-overflow concern as runJob: clamp via resolveTimeoutMs.
+  if (timeoutMs > 0) spawnOpts.timeout = Math.min(timeoutMs, MAX_SETTIMEOUT_MS);
   const r = spawnSync("gemini", args, spawnOpts);
   if (r.error && r.error.code === "ETIMEDOUT") {
     if (r.stdout) process.stdout.write(sanitizeForTerminal(r.stdout));
@@ -261,6 +275,13 @@ function runJob({ args, meta, stdin = null, showStdout = true, timeoutMs = 0 }) 
     let timeoutTimer = null;
     if (timeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
+        // The process may have exited cleanly between when the timer was
+        // queued and when this callback runs. clearTimeout is called inside
+        // proc.on('close'), but if both events land in the same event-loop
+        // turn the timer can fire microseconds before the close handler
+        // gets a chance to cancel it. Skipping when the child has already
+        // exited prevents mislabeling a successful run as `timed-out`.
+        if (proc.exitCode !== null || proc.signalCode !== null) return;
         timedOut = true;
         // Mirror killJob's pattern: write status BEFORE termination so the
         // close handler sees `timed-out` and does not race-overwrite it
@@ -430,15 +451,21 @@ async function cmdReview({ flags, positional }, { adversarial }) {
     // parse otherwise. The on-disk file has no cap, so size-check first to
     // avoid OOMing on a runaway response.
     let fullOut;
-    try {
-      const stat = fs.statSync(meta.stdout_path);
-      if (stat.size > MAX_REVIEW_JSON_BYTES) {
-        process.stderr.write(`[gemini-plugin] review --json: stdout log is ${stat.size} bytes, > ${MAX_REVIEW_JSON_BYTES} cap. Falling back to in-memory buffer (may be truncated at ${MAX_JOB_BUF} bytes).\n`);
-        fullOut = result.outBuf;
-      } else {
-        fullOut = fs.readFileSync(meta.stdout_path, "utf8");
-      }
-    } catch { fullOut = result.outBuf; }
+    let stat;
+    try { stat = fs.statSync(meta.stdout_path); } catch {}
+    if (stat && stat.size > MAX_REVIEW_JSON_BYTES) {
+      // Truncating a JSON payload guarantees JSON.parse fails, and the
+      // 256 KB outBuf is itself a truncated prefix of the real response.
+      // Emitting it as a "successful review" with exit 0 would mislead
+      // downstream consumers into trusting partial data. Refuse explicitly
+      // so the caller can branch; the full bytes remain on disk.
+      process.stderr.write(
+        `[gemini-plugin] review --json: output is ${stat.size} bytes, > ${MAX_REVIEW_JSON_BYTES} cap. Refusing to parse a truncated payload.\n` +
+        `Full output preserved at ${meta.stdout_path} (also reachable via /gemini:result ${meta.id}).\n`
+      );
+      process.exit(1);
+    }
+    try { fullOut = fs.readFileSync(meta.stdout_path, "utf8"); } catch { fullOut = result.outBuf; }
     try {
       const wrapper = JSON.parse(fullOut);
       let inner = (wrapper.response ?? "").trim();
@@ -494,6 +521,11 @@ async function cmdTask({ flags, positional }) {
     process.exit(2);
   }
 
+  // Validate the timeout flag before binary discovery — a typo is a user
+  // error and should be reported as such, not masked by "not installed".
+  // The write-gate above still fires first by design (policy > config).
+  const timeoutMs = resolveTimeoutMs(flags.timeout, DEFAULT_TASK_TIMEOUT_MS);
+
   if (!which("gemini")) {
     console.error("Gemini CLI not installed. Run `/gemini:setup`.");
     process.exit(127);
@@ -503,7 +535,6 @@ async function cmdTask({ flags, positional }) {
     process.stderr.write("[gemini-plugin] WRITE MODE ACTIVE — Gemini may modify files in this workspace.\n");
   }
   const args = ["-p", taskText, ...geminiBaseArgs({ readOnly: !isWrite, model: flags.model })];
-  const timeoutMs = resolveTimeoutMs(flags.timeout, DEFAULT_TASK_TIMEOUT_MS);
   const meta = buildJobMeta({
     kind: "task",
     args,
