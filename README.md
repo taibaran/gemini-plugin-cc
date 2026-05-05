@@ -1,5 +1,9 @@
 # gemini-plugin-cc
 
+[![CI](https://github.com/taibaran/gemini-plugin-cc/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/taibaran/gemini-plugin-cc/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen)](package.json)
+
 Claude Code plugin that lets you call Google's Gemini from inside a Claude Code session — for code review, adversarial review, and task delegation. Modeled on `openai/codex-plugin-cc`.
 
 ## What you get

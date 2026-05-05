@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # The plugin itself has zero npm runtime/dev deps; nothing to update on
+  # the npm side. The CI workflow does pin GitHub Actions by version
+  # (actions/checkout@v4, actions/setup-node@v4), so dependabot watches
+  # those and opens PRs when a newer release ships.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
