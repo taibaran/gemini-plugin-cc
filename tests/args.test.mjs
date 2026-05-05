@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseArgs, splitRawArgumentString, COMMON_BOOL_FLAGS, COMMON_VALUE_FLAGS } from "../plugins/gemini/scripts/lib/args.mjs";
+import { parseArgs, splitRawArgumentString, COMMON_BOOL_FLAGS, COMMON_VALUE_FLAGS, parseDuration } from "../plugins/gemini/scripts/lib/args.mjs";
 
 test("splitRawArgumentString: simple tokens", () => {
   assert.deepEqual(splitRawArgumentString("a b c"), ["a", "b", "c"]);
@@ -71,4 +71,48 @@ test("parseArgs: handles single-string-argv (Claude Code forwards $ARGUMENTS as 
 test("parseArgs: bool with =false sets to false", () => {
   const r = parseArgs(["--json=false"], { boolFlags: new Set(["json"]), valueFlags: new Set() });
   assert.equal(r.flags.json, false);
+});
+
+// parseDuration powers both --older-than (purge) and --timeout (ask/review/task).
+// Both call sites need the same forms accepted, so the suite below pins the
+// contract for any caller adding a duration-flavored flag in the future.
+test("parseDuration: accepts s/m/h/d unit suffixes", () => {
+  assert.equal(parseDuration("30s"), 30_000);
+  assert.equal(parseDuration("5m"), 300_000);
+  assert.equal(parseDuration("1h"), 3_600_000);
+  assert.equal(parseDuration("2d"), 172_800_000);
+});
+
+test("parseDuration: accepts explicit ms suffix", () => {
+  assert.equal(parseDuration("500ms"), 500);
+  assert.equal(parseDuration("1500ms"), 1500);
+});
+
+test("parseDuration: bare integer is ms (back-compat with cmdPurge contract)", () => {
+  assert.equal(parseDuration("100"), 100);
+  assert.equal(parseDuration("0"), 0);
+});
+
+test("parseDuration: zero disables timeout regardless of unit", () => {
+  // Callers treat 0 as "no timeout"; the parser must accept all unit forms.
+  assert.equal(parseDuration("0"), 0);
+  assert.equal(parseDuration("0s"), 0);
+  assert.equal(parseDuration("0m"), 0);
+  assert.equal(parseDuration("0ms"), 0);
+});
+
+test("parseDuration: rejects malformed input", () => {
+  assert.equal(parseDuration("abc"), null);
+  assert.equal(parseDuration("30x"), null);    // unknown unit
+  assert.equal(parseDuration("-5s"), null);    // negative
+  assert.equal(parseDuration("3.14s"), null);  // float
+  assert.equal(parseDuration(""), null);
+  assert.equal(parseDuration(null), null);
+  assert.equal(parseDuration(42), null);       // non-string
+});
+
+test("parseDuration: case-insensitive units", () => {
+  assert.equal(parseDuration("30S"), 30_000);
+  assert.equal(parseDuration("5M"), 300_000);
+  assert.equal(parseDuration("1H"), 3_600_000);
 });

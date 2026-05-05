@@ -1,51 +1,13 @@
 // The Stop-review-gate hook parses Gemini's JSON verdict. The parser is the
 // last line of defense against prompt-injection (a malicious diff cannot
 // trick Gemini into emitting a free-form "ALLOW" — it must produce a
-// strictly-shaped JSON). These tests pin the parser's contract.
-//
-// findBalancedJsonEnd / parseVerdict are not exported (the hook is a script,
-// not a module). We re-implement the same parsing logic here using the same
-// algorithm so the contract is testable. If the hook's logic is changed, this
-// test must change in lockstep — that is the point.
+// strictly-shaped JSON). These tests pin the parser's contract by importing
+// the production implementation directly, so a regression in lib/verdict.mjs
+// fails the suite.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-
-function findBalancedJsonEnd(s, start) {
-  let depth = 0, inString = false, escape = false;
-  for (let i = start; i < s.length; i++) {
-    const ch = s[i];
-    if (escape) { escape = false; continue; }
-    if (inString) {
-      if (ch === "\\") escape = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') { inString = true; continue; }
-    if (ch === "{") depth++;
-    else if (ch === "}") { depth--; if (depth === 0) return i; }
-  }
-  return -1;
-}
-
-function parseVerdict(raw) {
-  if (!raw) return null;
-  const trimmed = raw.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  const candidate = fenced ? fenced[1] : trimmed;
-  const start = candidate.indexOf("{");
-  if (start < 0) return null;
-  const end = findBalancedJsonEnd(candidate, start);
-  if (end < 0) return null;
-  let parsed;
-  try { parsed = JSON.parse(candidate.slice(start, end + 1)); } catch { return null; }
-  if (!parsed || typeof parsed !== "object") return null;
-  if (parsed.decision !== "allow" && parsed.decision !== "block") return null;
-  return {
-    decision: parsed.decision,
-    reason: typeof parsed.reason === "string" ? parsed.reason : ""
-  };
-}
+import { parseVerdict } from "../plugins/gemini/scripts/lib/verdict.mjs";
 
 test("parseVerdict: clean allow", () => {
   const r = parseVerdict('{"decision":"allow","reason":"all green"}');

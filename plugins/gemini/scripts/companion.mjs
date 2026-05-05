@@ -8,7 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 
-import { parseArgs, COMMON_BOOL_FLAGS, COMMON_VALUE_FLAGS } from "./lib/args.mjs";
+import { parseArgs, COMMON_BOOL_FLAGS, COMMON_VALUE_FLAGS, parseDuration } from "./lib/args.mjs";
 import {
   ensureDir, jobsDir, newJobId,
   writeJobMeta, readJobMeta, listJobs, pruneJobs,
@@ -19,10 +19,39 @@ import { captureDiff } from "./lib/git.mjs";
 import {
   which, geminiVersion, classifyAuthBlob,
   detectAuthSource, geminiBaseArgs, effectiveModel, DEFAULT_MODEL,
-  cleanGeminiEnv, probeWithFallback, checkMinVersion, MIN_GEMINI_VERSION
+  cleanGeminiEnv, probeWithFallback, checkMinVersion, MIN_GEMINI_VERSION,
+  MODEL_FALLBACK_CHAIN
 } from "./lib/gemini.mjs";
 import { buildReviewPrompt } from "./lib/prompts.mjs";
 import { renderJobTable, renderJobDetails, fmtTime, TerminalSanitizer, sanitizeForTerminal } from "./lib/render.mjs";
+
+// Conservative timeouts that protect against indefinite hangs without breaking
+// realistic large-diff reviews. Override with `--timeout <duration>`, or pass
+// `--timeout 0` to disable. Task has no default — rescue work is open-ended
+// by design and the user can always /gemini:cancel a stuck job.
+const DEFAULT_ASK_TIMEOUT_MS = 5 * 60 * 1000;       // 5 min
+const DEFAULT_REVIEW_TIMEOUT_MS = 20 * 60 * 1000;   // 20 min
+const DEFAULT_TASK_TIMEOUT_MS = 0;                  // unbounded
+
+function resolveTimeoutMs(rawFlag, defaultMs) {
+  if (rawFlag === undefined) return defaultMs;
+  const parsed = parseDuration(String(rawFlag));
+  if (parsed === null) {
+    console.error(`Invalid --timeout value: ${rawFlag}. Use forms like 300s, 20m, or 0 to disable.`);
+    process.exit(2);
+  }
+  return parsed;
+}
+
+// Hard cap on how much of the on-disk review log we will read into memory
+// for JSON parsing. The disk log is uncapped (raw bytes kept for debugging),
+// but JSON.parse on a multi-GB string would OOM the process.
+const MAX_REVIEW_JSON_BYTES = 8 * 1024 * 1024;      // 8 MB
+
+// Standard exit code for "command terminated by timeout" (matches GNU
+// timeout(1)). Distinguishable from policy refusals (2) and missing-binary
+// (127) so wrappers can tell timeouts apart from other failures.
+const EXIT_TIMEOUT = 124;
 
 // ---------- subcommand: setup ----------
 
@@ -108,8 +137,12 @@ function cmdSetup({ flags }) {
     }
     if (!probe.ok) {
       if (probe.detail === "model unavailable") {
+        // Read the candidates from MODEL_FALLBACK_CHAIN so this stays in sync
+        // when the chain changes; deduplicate against the default to avoid
+        // listing the same id twice.
+        const tried = [result.model.default, ...MODEL_FALLBACK_CHAIN.filter(m => m !== result.model.default)];
         result.nextSteps.push(
-          `No fallback-chain model is available for this account. Tried: ${[result.model.default, ...["gemini-3-pro-preview","gemini-2.5-pro"].filter(m => m !== result.model.default)].join(", ")}. Override with --model or GEMINI_PLUGIN_MODEL.`
+          `No fallback-chain model is available for this account. Tried: ${tried.join(", ")}. Override with --model or GEMINI_PLUGIN_MODEL.`
         );
       } else {
         result.nextSteps.push(
@@ -160,8 +193,19 @@ function cmdAsk({ flags, positional }) {
     console.error("Gemini CLI not installed. Run `/gemini:setup`.");
     process.exit(127);
   }
+  const timeoutMs = resolveTimeoutMs(flags.timeout, DEFAULT_ASK_TIMEOUT_MS);
   const args = ["-p", prompt, ...geminiBaseArgs({ readOnly: true, model: flags.model })];
-  const r = spawnSync("gemini", args, { encoding: "utf8", env: cleanGeminiEnv() });
+  const spawnOpts = { encoding: "utf8", env: cleanGeminiEnv() };
+  // spawnSync's `timeout` SIGTERMs the child after the deadline; r.error.code
+  // becomes ETIMEDOUT so we can distinguish a timeout from a normal failure.
+  if (timeoutMs > 0) spawnOpts.timeout = timeoutMs;
+  const r = spawnSync("gemini", args, spawnOpts);
+  if (r.error && r.error.code === "ETIMEDOUT") {
+    if (r.stdout) process.stdout.write(sanitizeForTerminal(r.stdout));
+    if (r.stderr) process.stderr.write(sanitizeForTerminal(r.stderr));
+    process.stderr.write(`\n[gemini-plugin] ask timed out after ${timeoutMs}ms. Re-run with --timeout 0 to disable, or pick a longer duration like --timeout 15m.\n`);
+    process.exit(EXIT_TIMEOUT);
+  }
   process.stdout.write(sanitizeForTerminal(r.stdout || ""));
   if (r.status !== 0) {
     if (r.stderr) process.stderr.write(sanitizeForTerminal(r.stderr));
@@ -183,7 +227,7 @@ const MAX_JOB_BUF = 256 * 1024;
 // Caller fills `meta` with id/kind/task_text/etc. and the stdout_path /
 // stderr_path under jobsDir(). This function fills in pid, status,
 // ended_at, exit_code, and persists meta on every transition.
-function runJob({ args, meta, stdin = null, showStdout = true }) {
+function runJob({ args, meta, stdin = null, showStdout = true, timeoutMs = 0 }) {
   return new Promise((resolve, reject) => {
     ensureDir(jobsDir());
     const stdoutFd = fs.openSync(meta.stdout_path, "w");
@@ -195,16 +239,38 @@ function runJob({ args, meta, stdin = null, showStdout = true }) {
 
     const proc = spawn("gemini", args, { stdio, detached: true, env: cleanGeminiEnv() });
     meta.pid = proc.pid;
+    if (timeoutMs > 0) meta.timeout_ms = timeoutMs;
     writeJobMeta(meta.id, meta);
     pruneJobs();
 
     if (stdin !== null) {
+      // Without an error handler, an EPIPE that occurs when Gemini exits
+      // before reading the stdin payload (auth fail / model unavailable /
+      // crash) becomes an unhandled stream error and tears down the whole
+      // companion process. The close handler will still see the non-zero
+      // exit code and surface the real reason via classifyAuthBlob.
+      proc.stdin.on("error", () => {});
       proc.stdin.write(stdin);
       proc.stdin.end();
     }
 
     let outBuf = "", errBuf = "";
     const sanitizer = new TerminalSanitizer();
+
+    let timedOut = false;
+    let timeoutTimer = null;
+    if (timeoutMs > 0) {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        // Mirror killJob's pattern: write status BEFORE termination so the
+        // close handler sees `timed-out` and does not race-overwrite it
+        // with `failed` when SIGTERM'd Gemini exits non-zero.
+        meta.status = "timed-out";
+        meta.ended_at = new Date().toISOString();
+        try { writeJobMeta(meta.id, meta); } catch {}
+        terminateProcessTree(proc.pid).catch(() => {});
+      }, timeoutMs);
+    }
 
     proc.stdout.on("data", d => {
       fs.writeSync(stdoutFd, d);
@@ -224,6 +290,7 @@ function runJob({ args, meta, stdin = null, showStdout = true }) {
     });
 
     proc.on("close", code => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       try { fs.closeSync(stdoutFd); } catch {}
       try { fs.closeSync(stderrFd); } catch {}
       if (showStdout) {
@@ -231,14 +298,15 @@ function runJob({ args, meta, stdin = null, showStdout = true }) {
         if (tail) process.stdout.write(tail);
       }
 
-      // killJob (cmdCancel) writes status: cancelled BEFORE this close fires,
-      // so re-read meta from disk to avoid race-overwriting "cancelled" with
-      // "failed" when a SIGTERM'd Gemini exits non-zero.
+      // killJob (cmdCancel) and the timeout timer both write a sticky status
+      // BEFORE this close fires, so re-read meta from disk to avoid
+      // race-overwriting "cancelled" or "timed-out" with "failed" when
+      // a SIGTERM'd Gemini exits non-zero.
       const current = readJobMeta(meta.id) || meta;
-      if (current.status === "cancelled") {
+      if (current.status === "cancelled" || current.status === "timed-out") {
         current.exit_code = code;
         writeJobMeta(meta.id, current);
-        meta.status = "cancelled";
+        meta.status = current.status;
       } else {
         meta.status = code === 0 ? "completed" : "failed";
         meta.exit_code = code;
@@ -246,16 +314,19 @@ function runJob({ args, meta, stdin = null, showStdout = true }) {
         writeJobMeta(meta.id, meta);
       }
 
-      if (code !== 0 && meta.status !== "cancelled") {
+      if (timedOut) {
+        process.stderr.write(`\n[gemini-plugin] Job ${meta.id} timed out after ${timeoutMs}ms. Re-run with --timeout 0 to disable, or pick a longer duration like --timeout 30m.\n`);
+      } else if (code !== 0 && meta.status !== "cancelled") {
         if (errBuf) process.stderr.write(sanitizeForTerminal(errBuf));
         const why = classifyAuthBlob(outBuf + "\n" + errBuf);
         if (why) process.stderr.write(`\n[hint: ${why}. Run /gemini:setup.]\n`);
       }
 
-      resolve({ code, outBuf, errBuf });
+      resolve({ code, outBuf, errBuf, timedOut });
     });
 
     proc.on("error", err => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
       try { fs.closeSync(stdoutFd); } catch {}
       try { fs.closeSync(stderrFd); } catch {}
       meta.status = "failed";
@@ -332,6 +403,7 @@ async function cmdReview({ flags, positional }, { adversarial }) {
   const target = diffResult.kind + (diffResult.base ? ` (base: ${diffResult.base})` : "");
   const prompt = buildReviewPrompt({ adversarial, focus, target, jsonOutput });
   const args = ["-p", prompt, ...geminiBaseArgs({ readOnly: true, model: flags.model, jsonOutput })];
+  const timeoutMs = resolveTimeoutMs(flags.timeout, DEFAULT_REVIEW_TIMEOUT_MS);
 
   const meta = buildJobMeta({
     kind: adversarial ? "adversarial-review" : "review",
@@ -342,20 +414,31 @@ async function cmdReview({ flags, positional }, { adversarial }) {
 
   let result;
   try {
-    result = await runJob({ args, meta, stdin: diffResult.diff, showStdout: !jsonOutput });
+    result = await runJob({ args, meta, stdin: diffResult.diff, showStdout: !jsonOutput, timeoutMs });
   } catch (err) {
     console.error(`Failed to spawn gemini: ${err.message}`);
     process.exit(127);
   }
+
+  if (result.timedOut) process.exit(EXIT_TIMEOUT);
 
   if (result.code === 0 && jsonOutput) {
     // Gemini's `-o json` returns: { session_id, response, stats }. Strip the
     // wrapper, strip markdown fences, validate shallow shape, emit clean JSON.
     // We re-read the full stdout file from disk because runJob's outBuf is
     // capped at MAX_JOB_BUF — a JSON payload near that cap would corrupt the
-    // parse otherwise. The on-disk file has no cap.
+    // parse otherwise. The on-disk file has no cap, so size-check first to
+    // avoid OOMing on a runaway response.
     let fullOut;
-    try { fullOut = fs.readFileSync(meta.stdout_path, "utf8"); } catch { fullOut = result.outBuf; }
+    try {
+      const stat = fs.statSync(meta.stdout_path);
+      if (stat.size > MAX_REVIEW_JSON_BYTES) {
+        process.stderr.write(`[gemini-plugin] review --json: stdout log is ${stat.size} bytes, > ${MAX_REVIEW_JSON_BYTES} cap. Falling back to in-memory buffer (may be truncated at ${MAX_JOB_BUF} bytes).\n`);
+        fullOut = result.outBuf;
+      } else {
+        fullOut = fs.readFileSync(meta.stdout_path, "utf8");
+      }
+    } catch { fullOut = result.outBuf; }
     try {
       const wrapper = JSON.parse(fullOut);
       let inner = (wrapper.response ?? "").trim();
@@ -420,6 +503,7 @@ async function cmdTask({ flags, positional }) {
     process.stderr.write("[gemini-plugin] WRITE MODE ACTIVE — Gemini may modify files in this workspace.\n");
   }
   const args = ["-p", taskText, ...geminiBaseArgs({ readOnly: !isWrite, model: flags.model })];
+  const timeoutMs = resolveTimeoutMs(flags.timeout, DEFAULT_TASK_TIMEOUT_MS);
   const meta = buildJobMeta({
     kind: "task",
     args,
@@ -429,7 +513,7 @@ async function cmdTask({ flags, positional }) {
 
   let result;
   try {
-    result = await runJob({ args, meta, stdin: null, showStdout: true });
+    result = await runJob({ args, meta, stdin: null, showStdout: true, timeoutMs });
   } catch (err) {
     console.error(`Failed to spawn gemini: ${err.message}`);
     process.exit(127);
@@ -437,6 +521,7 @@ async function cmdTask({ flags, positional }) {
 
   process.stdout.write(`\n\n[gemini-plugin] Job ${meta.id} ${meta.status} (exit ${result.code}).\n`);
   process.stdout.write(`[gemini-plugin] /gemini:result ${meta.id}\n`);
+  if (result.timedOut) process.exit(EXIT_TIMEOUT);
   process.exit(result.code ?? 0);
 }
 
@@ -533,22 +618,6 @@ async function killJob(meta) {
 }
 
 // ---------- subcommand: purge ----------
-
-function parseDuration(s) {
-  // Accept "30d", "12h", "45m", "60s", or a plain number-of-ms.
-  if (typeof s !== "string") return null;
-  const m = s.match(/^(\d+)\s*(s|m|h|d)?$/i);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  if (!Number.isFinite(n)) return null;
-  const unit = (m[2] || "ms").toLowerCase();
-  const mult = unit === "s" ? 1000
-    : unit === "m" ? 60_000
-    : unit === "h" ? 3_600_000
-    : unit === "d" ? 86_400_000
-    : 1;
-  return n * mult;
-}
 
 function cmdPurge({ flags }) {
   const ageRaw = flags["older-than"] || null;

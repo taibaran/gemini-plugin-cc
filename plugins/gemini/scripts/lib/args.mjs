@@ -75,5 +75,25 @@ export const COMMON_BOOL_FLAGS = new Set([
 ]);
 
 export const COMMON_VALUE_FLAGS = new Set([
-  "base", "scope", "model", "older-than"
+  "base", "scope", "model", "older-than", "timeout"
 ]);
+
+// Parse a duration string. Accepts "30d", "12h", "45m", "60s", "500ms", or a
+// plain integer treated as ms for backward compatibility with cmdPurge's
+// pre-extraction shape. Returns ms, or null on parse failure. `0` (with or
+// without unit) yields 0, which callers interpret as "disable timeout".
+export function parseDuration(s) {
+  if (typeof s !== "string") return null;
+  const m = s.trim().match(/^(\d+)\s*(ms|s|m|h|d)?$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n)) return null;
+  const unit = (m[2] || "ms").toLowerCase();
+  const mult = unit === "ms" ? 1
+    : unit === "s" ? 1000
+    : unit === "m" ? 60_000
+    : unit === "h" ? 3_600_000
+    : unit === "d" ? 86_400_000
+    : 1;
+  return n * mult;
+}

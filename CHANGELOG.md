@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.5.4 — Robustness pass on the dual Codex+Gemini review of v0.5.3
+
+A fresh Codex+Gemini review pass on v0.5.3 produced overlapping findings.
+This release closes the top five.
+
+- **Per-call timeouts**. `ask`, `review`, and `task` previously had no
+  plugin-level timeout — a hung Gemini call could strand a session
+  indefinitely. New `--timeout <duration>` flag (`30s` / `5m` / `1h` /
+  `0`-to-disable) wired into all three. Defaults: ask=5m, review=20m,
+  task=0 (unbounded by design — rescue work is open-ended; the user can
+  always `/gemini:cancel`). On timeout, `runJob` writes a sticky
+  `timed-out` status BEFORE termination so the close handler doesn't
+  race-overwrite it with `failed`, and the job uses
+  `terminateProcessTree` for SIGTERM→SIGKILL escalation. Exit code 124
+  (matches GNU `timeout(1)`) so wrappers can distinguish timeouts from
+  policy refusals (2) and missing-binary (127).
+- **`runJob` stdin gets an error handler**. Without it, an EPIPE that
+  occurs when Gemini exits before reading the stdin payload (auth fail,
+  model unavailable, crash) became an unhandled stream error and tore
+  down the whole companion process. Now swallowed; the close handler
+  still surfaces the real reason via `classifyAuthBlob`.
+- **`review --json` size-caps the JSON read**. The on-disk log is
+  intentionally uncapped (raw bytes for debugging), but
+  `JSON.parse(fs.readFileSync(...))` on a runaway multi-GB response would
+  OOM the process. New `MAX_REVIEW_JSON_BYTES = 8 MB` cap; over-cap
+  payloads fall back to the in-memory `outBuf` (capped at `MAX_JOB_BUF`)
+  with a stderr warning.
+- **`NODE_EXTRA_CA_CERTS` added to env allowlist**. Corporate
+  TLS-intercepting proxies need a custom CA bundle path or Node TLS in
+  the spawned `gemini` rejects the proxy's MITM certificate.
+  `NODE_OPTIONS` is intentionally NOT added — it accepts
+  `--require=evil.js` and would let a hostile env inject arbitrary code.
+- **`parseVerdict` extracted to `lib/verdict.mjs`**. The stop-gate
+  parser tests previously reimplemented the parser inline, so a parser
+  regression in production code would not have failed CI. The hook and
+  the test now both `import { parseVerdict }` from one source of truth.
+- **Polish from the same review:**
+  - `parseDuration` extracted from `companion.mjs` to `lib/args.mjs` and
+    extended to accept explicit `ms` suffix (back-compat: bare integer
+    still ms). Used by both `--older-than` and `--timeout`.
+  - Setup's "no fallback-chain model available" message now reads from
+    `MODEL_FALLBACK_CHAIN` instead of a hardcoded duplicate list.
+  - README path corrected: `DEFAULT_MODEL` lives in
+    `plugins/gemini/scripts/lib/gemini.mjs` (not `scripts/lib/...`)
+    after the v0.5.3 restructure.
+- **7 new tests (92 total).** `parseDuration` form coverage (s/m/h/d/ms,
+  zero-disables, malformed, case), `cleanGeminiEnv` allowlist for
+  `NODE_EXTRA_CA_CERTS` + drop of `NODE_OPTIONS`, and the
+  stop-gate-verdict suite now imports the production parser.
+
+### Known follow-ups (not addressed in 0.5.4)
+
+- `setReviewGate` and `setActiveModel` still race on `config.json`
+  read-modify-write. The atomic write prevents torn files but
+  concurrent toggles can drop each other's fields. Low likelihood given
+  setup is a one-shot user action.
+- `session-lifecycle-hook.mjs` uses `process.cwd()` for cleanup while
+  `stop-review-gate-hook.mjs` reads `cwd` from hook input. If Claude
+  Code ever invokes lifecycle hooks from a different working directory,
+  cleanup could target the wrong workspace. Worth aligning in a future
+  pass.
+- Stop-hook's 12-min timeout sends only SIGTERM; no SIGKILL escalation.
+  Out of scope for this release; tracked for the next robustness pass.
+
 ## 0.5.3 — Restructure to plugins/gemini/ subdirectory (fix marketplace install)
 
 Real install attempt surfaced a marketplace-schema validation error:

@@ -1,6 +1,6 @@
 ---
 description: Ask Gemini a one-off question (read-only)
-argument-hint: '[--model <model>] <question>'
+argument-hint: '[--model <model>] [--timeout <duration>] <question>'
 disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---

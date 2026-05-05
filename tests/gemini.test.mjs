@@ -54,6 +54,20 @@ test("cleanGeminiEnv: keeps locale, terminal, and proxy", () => {
   assert.equal(cleaned.HTTP_PROXY, "http://proxy:8080");
 });
 
+test("cleanGeminiEnv: keeps NODE_EXTRA_CA_CERTS but drops NODE_OPTIONS", () => {
+  // NODE_EXTRA_CA_CERTS is needed for corporate TLS-intercepting proxies.
+  // NODE_OPTIONS accepts `--require=path.js` and would let a hostile env
+  // inject arbitrary code into the gemini process — must stay dropped.
+  const fake = {
+    PATH: "/u",
+    NODE_EXTRA_CA_CERTS: "/etc/ssl/corp-ca-bundle.crt",
+    NODE_OPTIONS: "--require=/tmp/evil.js"
+  };
+  const cleaned = cleanGeminiEnv(fake);
+  assert.equal(cleaned.NODE_EXTRA_CA_CERTS, "/etc/ssl/corp-ca-bundle.crt");
+  assert.equal("NODE_OPTIONS" in cleaned, false);
+});
+
 test("cleanGeminiEnv: drops random unknown vars", () => {
   const fake = { PATH: "/u", SECRET_THING: "leak", npm_config_cache: "/foo" };
   const cleaned = cleanGeminiEnv(fake);

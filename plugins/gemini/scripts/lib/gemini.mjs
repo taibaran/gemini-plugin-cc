@@ -32,7 +32,13 @@ const ALLOWED_ENV_KEYS = new Set([
   "GOOGLE_CLOUD_PROJECT", "VERTEXAI_PROJECT", "VERTEXAI_LOCATION",
   // Proxy (corporate networks)
   "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
-  "http_proxy", "https_proxy", "no_proxy", "all_proxy"
+  "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+  // Custom CA bundle for corporate TLS-intercepting proxies. Without this,
+  // Node TLS in the spawned `gemini` rejects the proxy's MITM certificate
+  // and authentication fails on otherwise-valid setups. NOT adding
+  // NODE_OPTIONS — that one accepts `--require=path.js` and would let a
+  // hostile env inject arbitrary code into the gemini process.
+  "NODE_EXTRA_CA_CERTS"
 ]);
 // LC_* covers all locale category overrides (LC_NUMERIC, LC_TIME, etc.).
 const ALLOWED_PREFIXES = ["LC_"];

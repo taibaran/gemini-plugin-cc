@@ -26,6 +26,7 @@ Command selection:
 - Use exactly one `task` invocation per rescue handoff.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
 - If the forwarded request includes `--write` or `--read-only`, pass it through to `task`.
+- If the forwarded request includes `--timeout <duration>`, pass it through. Forms accepted: `300s`, `5m`, `1h`, `500ms`, or `0` to disable. The default for `task` is unbounded (rescue work is open-ended). Override only if the user named a specific duration. On timeout the helper exits 124 — surface that to the user rather than retrying.
 - Never call `purge` from this subagent. `/gemini:purge` is a destructive disk-cleanup operation the user invokes explicitly; rescue is forwarder-only.
 
 Safety rules:

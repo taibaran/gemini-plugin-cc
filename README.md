@@ -70,9 +70,23 @@ By default the plugin pins every Gemini invocation to `gemini-3.1-pro-preview`
 (the strongest Pro tier as of 2026-04). To override:
 - `--model <id>` per call: `/gemini:ask --model gemini-2.5-pro <question>`
 - `GEMINI_PLUGIN_MODEL=<id>` env var (in `~/.claude/settings.json` under `env`)
-- Edit `DEFAULT_MODEL` in `scripts/lib/gemini.mjs`
+- Edit `DEFAULT_MODEL` in `plugins/gemini/scripts/lib/gemini.mjs`
 
 `/gemini:setup` reports the currently active model.
+
+## Timeouts
+
+Every per-call subcommand accepts `--timeout <duration>`:
+
+- `/gemini:ask --timeout 90s explain monads` — fail after 90 seconds.
+- `/gemini:review --timeout 30m` — give Gemini up to 30 min on a big diff.
+- `/gemini:rescue --timeout 0 investigate slow build` — disable timeout.
+
+Defaults: ask 5 min, review 20 min, rescue/task **unbounded** (rescue work is
+open-ended; cancel with `/gemini:cancel <job-id>` if it overshoots). Accepted
+forms: `300s` / `5m` / `1h` / `500ms` / bare integer (ms). Exit code on
+timeout is **124** (matches `timeout(1)`), distinguishable from policy
+refusals (2) and missing-binary (127).
 
 ## Try it without installing
 

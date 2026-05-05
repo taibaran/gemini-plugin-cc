@@ -1,6 +1,6 @@
 ---
 description: Run a Gemini review that challenges the implementation approach and design choices
-argument-hint: '[--base <ref>] [--scope auto|working-tree|branch|staged|unstaged] [--model <model>] [--wait|--background] [focus ...]'
+argument-hint: '[--base <ref>] [--scope auto|working-tree|branch|staged|unstaged] [--model <model>] [--timeout <duration>] [--wait|--background] [focus ...]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---

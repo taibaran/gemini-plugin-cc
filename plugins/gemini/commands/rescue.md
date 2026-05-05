@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up rescue work to the Gemini rescue subagent
-argument-hint: '[--background|--wait] [--write|--read-only] [--model <model>] [what Gemini should investigate, solve, or continue]'
+argument-hint: '[--background|--wait] [--write|--read-only] [--model <model>] [--timeout <duration>] [what Gemini should investigate, solve, or continue]'
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
