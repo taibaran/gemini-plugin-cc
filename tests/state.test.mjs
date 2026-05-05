@@ -195,37 +195,49 @@ test("setReviewGate: removes the lock file after the operation", () => {
 });
 
 test("setReviewGate + setActiveModel concurrent calls preserve both fields", async () => {
-  // Real concurrency check: spawn two child processes that each set a
-  // different field in config.json. Without the lock, the second writer
-  // races against the first's read-modify-write and one update is lost.
-  // With the lock, both fields end up persisted.
-  const { spawnSync } = await import("node:child_process");
-  const { setActiveModel, readConfig } = await import("../plugins/gemini/scripts/lib/state.mjs");
+  // Genuinely-concurrent contention check: launch many child processes via
+  // async spawn() (NOT spawnSync, which serializes) and Promise.all on
+  // their exits, so the OS schedules them overlappingly. Without the
+  // lock, the read-modify-write windows interleave and updates are lost.
+  // With the lock, every writer's update lands.
+  const { spawn } = await import("node:child_process");
   const path = await import("node:path");
   const url = await import("node:url");
   const here = path.dirname(url.fileURLToPath(import.meta.url));
   const tmpData = process.env.CLAUDE_PLUGIN_DATA;
+  const stateModule = path.resolve(here, "../plugins/gemini/scripts/lib/state.mjs").replace(/\\/g, "/");
 
-  // Two child processes, fired in parallel, each updating one field.
-  const child = (script) => spawnSync(process.execPath, ["-e", script], {
-    encoding: "utf8",
-    env: { ...process.env, CLAUDE_PLUGIN_DATA: tmpData }
-  });
   const setGateScript = `
-    import("${path.resolve(here, "../plugins/gemini/scripts/lib/state.mjs").replace(/\\/g, "/")}").then(m => {
-      m.setReviewGate(process.cwd(), true);
-    });
+    import("${stateModule}").then(m => m.setReviewGate(process.cwd(), true));
   `;
   const setModelScript = `
-    import("${path.resolve(here, "../plugins/gemini/scripts/lib/state.mjs").replace(/\\/g, "/")}").then(m => {
-      m.setActiveModel(process.cwd(), "gemini-2.5-pro");
-    });
+    import("${stateModule}").then(m => m.setActiveModel(process.cwd(), "gemini-2.5-pro"));
   `;
-  // Sequential is enough for correctness — both writes must land atomically
-  // through the lock. (Truly-concurrent integration testing is fragile in
-  // node:test; sequential exercises the lock path without flake.)
-  child(setGateScript);
-  child(setModelScript);
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: tmpData };
+
+  function launch(script) {
+    return new Promise((resolve, reject) => {
+      const p = spawn(process.execPath, ["-e", script], {
+        env,
+        stdio: ["ignore", "ignore", "pipe"]
+      });
+      let err = "";
+      p.stderr.on("data", d => { err += d.toString(); });
+      p.on("exit", code => code === 0 ? resolve() : reject(new Error(`child exited ${code}: ${err}`)));
+      p.on("error", reject);
+    });
+  }
+
+  // Multiple writers per side: alternating gate-toggle and model-set so
+  // any unlocked window of one would clobber the other's recent write.
+  const procs = [];
+  for (let i = 0; i < 4; i++) {
+    procs.push(launch(setGateScript));
+    procs.push(launch(setModelScript));
+  }
+  await Promise.all(procs);
+
+  const { readConfig } = await import("../plugins/gemini/scripts/lib/state.mjs");
   const cfg = readConfig(process.cwd());
   assert.equal(cfg.reviewGateEnabled, true);
   assert.equal(cfg.activeModel, "gemini-2.5-pro");
