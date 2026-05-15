@@ -514,6 +514,17 @@ async function cmdReview({ flags, positional }, { adversarial }) {
     console.error(`Invalid git ref for --base: ${base}`);
     process.exit(2);
   }
+  if (diffResult.kind === "diff-failed") {
+    // The branch ref resolved fine, but `git diff <ref>...HEAD` itself
+    // failed (no merge base under unrelated histories, shallow clone
+    // missing history, ambiguous ref, etc.). Surface the actual git
+    // error rather than collapsing to a misleading "Nothing to review".
+    // Common fix: `git fetch --unshallow` or pick a base that shares
+    // history with HEAD.
+    console.error(`git diff failed for --base ${diffResult.base}: ${diffResult.error}`);
+    console.error("Common causes: shallow clone (try `git fetch --unshallow`), unrelated histories, or the base ref not on the remote.");
+    process.exit(2);
+  }
   if (!diffResult.diff.trim()) {
     console.log(`Nothing to review (scope: ${diffResult.kind}${diffResult.base ? `, base: ${diffResult.base}` : ""}).`);
     process.exit(0);

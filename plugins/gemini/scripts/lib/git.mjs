@@ -8,6 +8,16 @@ import { spawnSync } from "node:child_process";
 // anything larger is truncated with a marker so the reviewer knows.
 export const MAX_DIFF_BYTES = 4 * 1024 * 1024;
 
+// Node's spawnSync default maxBuffer is 1 MB. Without raising it explicitly,
+// any `git diff` between 1 MB and `MAX_DIFF_BYTES` exceeds Node's child-stdout
+// buffer and the call returns ENOBUFS with the stdout truncated to the cap —
+// our own `truncateDiff` logic never runs and no truncation marker is added.
+// Set maxBuffer above MAX_DIFF_BYTES with slack so truncation is always our
+// decision, not Node's silent default. (v0.5.14: caught by Codex during
+// /grok:aggregate-review against the full robustness arc.)
+const GIT_SPAWN_MAX_BUFFER = MAX_DIFF_BYTES + 64 * 1024;
+const GIT_DIFF_SPAWN = { encoding: "utf8", maxBuffer: GIT_SPAWN_MAX_BUFFER };
+
 // Refs we accept on the command line. Forbids anything starting with `-`
 // (would be parsed as a git option), null bytes, whitespace, and quote
 // metacharacters. Permits the standard `[a-zA-Z0-9_./-]` plus refspec syntax.
@@ -54,25 +64,46 @@ export function captureDiff({ scope, base, cwd } = {}) {
     // come BEFORE `--`. The trailing `--` still terminates option parsing
     // for any future arg the caller might add, preserving the defense
     // intent of the original code.
-    const r = spawnSync("git", ["diff", `${ref}...HEAD`, "--"], { encoding: "utf8", cwd });
-    // Older git versions (<2.5) may not accept the trailing `--` after a
-    // refspec form `A...B`. Fall back to the plain refspec form.
-    const out = r.status === 0
-      ? (r.stdout || "")
-      : (spawnSync("git", ["diff", `${ref}...HEAD`], { encoding: "utf8", cwd }).stdout || "");
+    const r = spawnSync("git", ["diff", `${ref}...HEAD`, "--"], { ...GIT_DIFF_SPAWN, cwd });
+    let out = "";
+    let diffError = null;
+    if (r.status === 0) {
+      out = r.stdout || "";
+    } else {
+      // Older git versions (<2.5) may not accept the trailing `--` after a
+      // refspec form `A...B`. Fall back to the plain refspec form.
+      const fb = spawnSync("git", ["diff", `${ref}...HEAD`], { ...GIT_DIFF_SPAWN, cwd });
+      if (fb.status === 0) {
+        out = fb.stdout || "";
+      } else {
+        // BOTH forms failed. This is NOT a clean branch — it's a real diff
+        // failure (no merge base under unrelated histories, shallow clone
+        // that's missing the base ref's history, ambiguous ref, etc.).
+        // Returning `kind: "branch", diff: ""` here would let cmdReview
+        // print "Nothing to review" — the same false-negative that issue
+        // #4 reported under a different cause. Surface the failure
+        // explicitly so callers can exit non-zero with the git error.
+        // (v0.5.14: 3/3 reviewer consensus during the aggregate-review of
+        // the v0.5.13 fix.)
+        diffError = (fb.stderr || r.stderr || "git diff exited non-zero with no stderr").trim();
+      }
+    }
+    if (diffError !== null) {
+      return { kind: "diff-failed", diff: "", base: ref, error: diffError };
+    }
     return { kind: "branch", diff: truncateDiff(out), base: ref };
   }
   if (scope === "staged") {
-    const r = spawnSync("git", ["diff", "--cached"], { encoding: "utf8", cwd });
+    const r = spawnSync("git", ["diff", "--cached"], { ...GIT_DIFF_SPAWN, cwd });
     return { kind: "staged", diff: truncateDiff(r.stdout || "") };
   }
   if (scope === "unstaged") {
-    const r = spawnSync("git", ["diff"], { encoding: "utf8", cwd });
+    const r = spawnSync("git", ["diff"], { ...GIT_DIFF_SPAWN, cwd });
     return { kind: "unstaged", diff: truncateDiff(r.stdout || "") };
   }
   // auto / working-tree
-  const cached = spawnSync("git", ["diff", "--cached"], { encoding: "utf8", cwd }).stdout || "";
-  const unstaged = spawnSync("git", ["diff"], { encoding: "utf8", cwd }).stdout || "";
+  const cached = spawnSync("git", ["diff", "--cached"], { ...GIT_DIFF_SPAWN, cwd }).stdout || "";
+  const unstaged = spawnSync("git", ["diff"], { ...GIT_DIFF_SPAWN, cwd }).stdout || "";
   return { kind: "working-tree", diff: truncateDiff(cached + unstaged) };
 }
 

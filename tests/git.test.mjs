@@ -83,3 +83,41 @@ test("captureDiff scope=branch returns the actual diff (issue #4 regression)", (
   assert.match(result.diff, /\+version two/, "branch diff must contain the new line");
   assert.match(result.diff, /-version one/, "branch diff must contain the removed line");
 });
+
+// v0.5.14 regression guard for the same bug class as #4 but a DIFFERENT cause.
+// The v0.5.13 fix only addressed the "-- separator misparsed as pathspec" case.
+// `git diff <ref>...HEAD` can ALSO fail with status 128 + stderr when there's
+// no merge base (unrelated histories, shallow clones missing history, etc.),
+// and the prior code returned `kind: "branch", diff: ""` for that too — same
+// silent "Nothing to review" false-negative. The fix introduces a distinct
+// `kind: "diff-failed"` so callers exit non-zero with the actual git error.
+// Caught by 3/3 reviewer consensus during /grok:aggregate-review of v0.5.13.
+test("captureDiff scope=branch surfaces git failure (no merge base) instead of silent empty", () => {
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "gemini-plugin-test-orphan-"));
+  const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" };
+  const opts = { cwd: repoDir, encoding: "utf8", env };
+  const run = (...args) => spawnSync("git", args, opts);
+
+  run("init", "-q", "-b", "main");
+  run("commit", "--allow-empty", "-q", "-m", "init");
+  fs.writeFileSync(path.join(repoDir, "a.txt"), "alpha\n");
+  run("add", "a.txt");
+  run("commit", "-q", "-m", "alpha");
+
+  // Create an orphan branch — unrelated history from `main`, no merge base.
+  run("checkout", "--orphan", "other", "-q");
+  // Remove the staged content from the parent index so the orphan commit
+  // doesn't share blobs.
+  run("rm", "-rf", "--cached", ".");
+  fs.writeFileSync(path.join(repoDir, "b.txt"), "beta\n");
+  run("add", "b.txt");
+  run("commit", "-q", "-m", "beta");
+
+  // `git diff main...HEAD` from the orphan branch: no merge base → exit 128.
+  // The legitimate ref passes verify, so we DO reach the diff stage.
+  const result = captureDiff({ scope: "branch", base: "main", cwd: repoDir });
+  assert.equal(result.kind, "diff-failed",
+    `expected kind=diff-failed for orphan-branch diff, got kind=${result.kind} diff.length=${result.diff?.length} (the v0.5.13 fix would have returned kind=branch with diff="")`);
+  assert.equal(result.base, "main");
+  assert.match(result.error || "", /no merge base/i, "diff-failed result must carry the git error message");
+});
