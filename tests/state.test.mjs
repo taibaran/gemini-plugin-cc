@@ -276,8 +276,9 @@ test("withConfigLock: a fresh lock can be reclaimed only after the holder pid di
   const dir = stateDir(process.cwd());
   const lockPath = path.join(dir, "config.json.lock");
 
-  // 1. Live holder, even with backdated mtime: a 2-second acquire timeout
-  //    from a separate child must fail rather than steal the lock.
+  // 1. Live holder, even with backdated mtime: the child's acquire loop
+  //    (CONFIG_LOCK_TIMEOUT_MS) must time out and fail rather than steal
+  //    the lock, because liveness wins over aged mtime.
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(lockPath, String(process.pid));
   const oldTime = new Date(Date.now() - 10 * 60_000);  // 10 min ago
@@ -295,7 +296,13 @@ test("withConfigLock: a fresh lock can be reclaimed only after the holder pid di
   const liveHolderResult = spawnSync(process.execPath, ["-e", acquireScript], {
     encoding: "utf8",
     env: { ...process.env, CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA },
-    timeout: 7000
+    // Child must outlast CONFIG_LOCK_TIMEOUT_MS (12 s in 0.5.11+) so the
+    // assertion that the live holder's lock is NOT stolen actually
+    // exercises the full acquire loop. Was hardcoded 7 s in 0.5.7-0.5.10
+    // and silently passed for the wrong reason after 0.5.11 raised the
+    // internal timeout to 12 s. 20 s gives 8 s of slack on top of the
+    // 12 s loop.
+    timeout: 20000
   });
   // The waiter should have failed to acquire (exit 1) because the live holder
   // pid kept the lock, despite the aged mtime.
@@ -307,7 +314,13 @@ test("withConfigLock: a fresh lock can be reclaimed only after the holder pid di
   const deadHolderResult = spawnSync(process.execPath, ["-e", acquireScript], {
     encoding: "utf8",
     env: { ...process.env, CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA },
-    timeout: 7000
+    // Child must outlast CONFIG_LOCK_TIMEOUT_MS (12 s in 0.5.11+) so the
+    // assertion that the live holder's lock is NOT stolen actually
+    // exercises the full acquire loop. Was hardcoded 7 s in 0.5.7-0.5.10
+    // and silently passed for the wrong reason after 0.5.11 raised the
+    // internal timeout to 12 s. 20 s gives 8 s of slack on top of the
+    // 12 s loop.
+    timeout: 20000
   });
   assert.equal(deadHolderResult.status, 0,
     `Dead holder's lock should be reclaimable. stderr=${deadHolderResult.stderr} stdout=${deadHolderResult.stdout}`);
@@ -344,7 +357,13 @@ test("withConfigLock: reclaims a 0-byte / malformed lock after the stale window"
   const r = spawnSync(process.execPath, ["-e", acquireScript], {
     encoding: "utf8",
     env: { ...process.env, CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA },
-    timeout: 7000
+    // Child must outlast CONFIG_LOCK_TIMEOUT_MS (12 s in 0.5.11+) so the
+    // assertion that the live holder's lock is NOT stolen actually
+    // exercises the full acquire loop. Was hardcoded 7 s in 0.5.7-0.5.10
+    // and silently passed for the wrong reason after 0.5.11 raised the
+    // internal timeout to 12 s. 20 s gives 8 s of slack on top of the
+    // 12 s loop.
+    timeout: 20000
   });
   assert.equal(r.status, 0,
     `Empty/malformed lock should be reclaimable after stale window. stderr=${r.stderr} stdout=${r.stdout}`);

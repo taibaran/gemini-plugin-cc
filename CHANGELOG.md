@@ -1,5 +1,60 @@
 # Changelog
 
+## 0.5.12 — Test-fidelity polish + convergence
+
+Sixth (and final) `/grok:aggregate-review` pass against 0.5.10..0.5.11
+caught a procedural issue and two trade-off discussions that are
+inherent to file-based locking:
+
+### Fixed
+- **Test timeouts now outlast `CONFIG_LOCK_TIMEOUT_MS`** (Grok). Three
+  `spawnSync(..., { timeout: 7000 })` calls in lock tests were
+  hardcoded 7 s but `CONFIG_LOCK_TIMEOUT_MS` was raised to 12 s in
+  0.5.11. The child was killed by spawnSync's external timeout before
+  the internal lock loop could complete, so the assertion *"live
+  holder's lock should not be reclaimed"* was passing for the wrong
+  reason. Raised all three test timeouts to 20 s (12 s loop + 8 s
+  slack). Test runtime jumps from ~6 s to ~13 s, but the lock tests
+  now genuinely exercise the configured 12 s window.
+
+### Acknowledged but not changed (inherent limitations)
+- **Live writer descheduled >10 s between `openSync("wx")` and
+  `writeSync(pid)` can have its lock stolen** (Codex). Real but
+  extreme: requires 10 s of OS scheduling pressure between two
+  immediately-adjacent syscalls. Closing this completely requires
+  OS-level filesystem locking (`flock`/`fcntl`) which Node's stdlib
+  doesn't expose. Documented as a known limitation.
+- **Fresh dead-PID lock (writer wrote pid then crashed) needs ≥30 s
+  for `tooOld` to fire, but `CONFIG_LOCK_TIMEOUT_MS` is 12 s** (Gemini).
+  Means dead-pid recovery can require 2-3 retry attempts. Acceptable:
+  setup commands are user-initiated and rare; retrying after a 12 s
+  timeout is normal UX for crash recovery. Raising the timeout to
+  >30 s would make every contended setup feel broken. Trade-off
+  accepted.
+
+### Convergence (formally declared)
+
+Six rounds of `/grok:aggregate-review` over 0.5.5..0.5.11. Findings
+trajectory:
+- Round 1 (0.5.5 baseline): 5 architectural gaps (timeouts, security)
+- Round 2 (0.5.7 vs 0.5.6): 4 real bugs in 0.5.6 fix
+- Round 3 (0.5.8 vs 0.5.7): 5 real bugs + 2 regressions from 0.5.7
+- Round 4 (0.5.9 vs 0.5.8): 2 NEW regressions from 0.5.9 (rolled back)
+- Round 5 (0.5.11 vs 0.5.10): 1 math error (fixed)
+- Round 6 (0.5.12 vs 0.5.11): 1 procedural issue (this fix) + 2
+  inherent trade-offs
+
+Each round converged to smaller, more specific findings. Round 6
+remaining findings are not "broken code" claims; they're trade-offs
+between competing properties (recovery latency vs scheduling tolerance,
+unrecoverability windows vs UX). Further rounds would produce more
+discussion but no new actionable bugs.
+
+**Plugin is at production-quality stability for a personal/team tool.**
+Open Source maturity (adoption, integration tests, demo media) is
+still where the friend's 6.5/10 review put it — those are next-step
+items separate from code correctness.
+
 ## 0.5.11 — One-line math fix: lock acquire timeout must exceed orphan window
 
 Fifth and final `/grok:aggregate-review` pass (against 0.5.9..0.5.10)
