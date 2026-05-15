@@ -216,7 +216,14 @@ export function writeConfig(cwd, config) {
 //     which we need because setReviewGate / setActiveModel are sync.
 import { isAlive } from "./process.mjs";
 
-const CONFIG_LOCK_TIMEOUT_MS = 5000;
+// IMPORTANT INVARIANT: CONFIG_LOCK_TIMEOUT_MS > CONFIG_LOCK_ORPHAN_MS.
+// A waiter's acquire loop must outlast the orphan threshold, otherwise
+// a fresh 0-byte lock from a writer that crashed between `openSync("wx")`
+// and `writeSync(pid)` is structurally unrecoverable within one
+// acquire attempt — the waiter gives up before the orphan window opens.
+// 12 s vs 10 s gives 2 s of polling slack past the orphan threshold,
+// guaranteeing reclaim is reachable on the first try.
+const CONFIG_LOCK_TIMEOUT_MS = 12_000;
 const CONFIG_LOCK_STALE_MS = 30_000;
 // Window for the no-PID-stamp recovery path. v0.5.9 tried 2 s, but
 // adversarial review found a real race: a legitimate writer can be
@@ -225,7 +232,8 @@ const CONFIG_LOCK_STALE_MS = 30_000;
 // (heavy GC, CPU contention, fsync pressure). A waiter that sees the
 // just-created lock would steal it. 10 s is a middle ground: tolerant
 // of realistic scheduling latency, but still much faster than the
-// 30 s dead-pid window.
+// 30 s dead-pid window. v0.5.10's rollback raised this to 10 s without
+// adjusting CONFIG_LOCK_TIMEOUT_MS — 0.5.11 fixed the invariant above.
 const CONFIG_LOCK_ORPHAN_MS = 10_000;
 const CONFIG_LOCK_POLL_MS = 25;
 

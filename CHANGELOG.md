@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.11 — One-line math fix: lock acquire timeout must exceed orphan window
+
+Fifth and final `/grok:aggregate-review` pass (against 0.5.9..0.5.10)
+caught a math error in the v0.5.10 rollback:
+
+- v0.5.10 raised `CONFIG_LOCK_ORPHAN_MS` from 2 s to 10 s (to tolerate
+  the open→writeSync scheduling gap), but kept `CONFIG_LOCK_TIMEOUT_MS`
+  at 5 s. Result: a fresh 0-byte orphan lock is structurally
+  unrecoverable in a single acquire attempt — the waiter gives up
+  after 5 s of polling, but the orphan window doesn't open until 10 s.
+
+### Fix
+
+- `CONFIG_LOCK_TIMEOUT_MS` raised to 12 s (was 5 s). 2 s of polling
+  slack past the 10 s orphan window, guaranteeing reclaim is reachable
+  on the first acquire attempt.
+- Added a comment block stating the invariant
+  (`CONFIG_LOCK_TIMEOUT_MS > CONFIG_LOCK_ORPHAN_MS`) explicitly, so a
+  future change to either constant has a visible reminder.
+
+### Convergence note
+
+Five rounds of `/grok:aggregate-review` over 0.5.5..0.5.10 with
+adversarial framing. Round 5 produced no new bugs beyond the math
+error this release fixes. The remaining reviewer comments are:
+- "no integration test for `terminateProcessTree`" — true and fair,
+  but adding real-process integration tests is its own work item;
+  the function's call sites are well-defined and the unit tests for
+  `isValidPid`/`isAlive` plus the dispatcher smoke tests cover the
+  composition.
+- ">10 s scheduling gap between open and write" — extreme corner
+  (laptop sleep mid-syscall, SIGSTOP/SIGCONT, etc.). Genuine OS-level
+  filesystem locking would be needed to close this; out of scope for
+  a Claude Code plugin.
+
+Declaring stable. Further adversarial review will produce trade-off
+discussions but no new clear-cut bugs.
+
 ## 0.5.10 — Rollback v0.5.9's two unsafe optimizations
 
 The fourth `/grok:aggregate-review` pass (against 0.5.8..0.5.9) found
