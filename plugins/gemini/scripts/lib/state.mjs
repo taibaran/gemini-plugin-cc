@@ -218,14 +218,15 @@ import { isAlive } from "./process.mjs";
 
 const CONFIG_LOCK_TIMEOUT_MS = 5000;
 const CONFIG_LOCK_STALE_MS = 30_000;
-// Tighter window for the no-PID-stamp recovery path. A healthy writer
-// can never leave a 0-byte file for >2 s — writeSync is synchronous and
-// completes in microseconds. If a 0-byte lock has been there 2 seconds,
-// it's almost certainly from a terminated process. Without this shorter
-// threshold, a freshly-crashed writer leaves operations blocked for the
-// full 30 s `CONFIG_LOCK_STALE_MS` even though the writer is already
-// gone.
-const CONFIG_LOCK_ORPHAN_MS = 2_000;
+// Window for the no-PID-stamp recovery path. v0.5.9 tried 2 s, but
+// adversarial review found a real race: a legitimate writer can be
+// OS-descheduled between `openSync("wx")` (which creates the visible
+// 0-byte file) and `writeSync(fd, pid)` for more than 2 s under load
+// (heavy GC, CPU contention, fsync pressure). A waiter that sees the
+// just-created lock would steal it. 10 s is a middle ground: tolerant
+// of realistic scheduling latency, but still much faster than the
+// 30 s dead-pid window.
+const CONFIG_LOCK_ORPHAN_MS = 10_000;
 const CONFIG_LOCK_POLL_MS = 25;
 
 function sleepSync(ms) {

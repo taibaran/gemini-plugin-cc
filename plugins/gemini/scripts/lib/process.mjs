@@ -32,7 +32,7 @@ export function isAlive(pid) {
 // and ESRCH on an empty group is harmless. The previous "isAlive at top"
 // guard caused descendants to leak whenever the leader exited on SIGTERM
 // or was reaped before this function was called.
-export function terminateProcessTree(pid, { graceMs = 2000, closedPromise } = {}) {
+export function terminateProcessTree(pid, { graceMs = 2000 } = {}) {
   if (!isValidPid(pid)) return Promise.resolve();
   // Always attempt the group SIGTERM first — even if the leader is already
   // dead, surviving group descendants need the signal. EPERM means the
@@ -49,16 +49,17 @@ export function terminateProcessTree(pid, { graceMs = 2000, closedPromise } = {}
       try { process.kill(pid, "SIGTERM"); } catch {}
     }
   }
-  // Race the SIGKILL grace window against the optional `closedPromise`.
-  // Callers that can observe the child's close event pass it in; we then
-  // skip the full graceMs wait once the child has actually exited, since
-  // SIGKILL on a dead leader is moot (and after the kernel reaps the pid
-  // it would risk hitting a recycled pid). Callers that don't pass it
-  // get the old behavior: wait full graceMs, then SIGKILL.
+  // Always wait the full graceMs and then SIGKILL the group. A previous
+  // optimization (v0.5.9) let callers short-circuit this wait via a
+  // `closedPromise` parameter, on the theory that "if the leader closed,
+  // descendants will cascade out via SIGHUP from the controlling tty".
+  // That assumption was wrong: `spawn` with pipe stdio doesn't allocate a
+  // PTY, so SIGTERM-ignoring descendants get reparented to init and run
+  // forever. v0.5.10 reverts to the safer "always group-SIGKILL after
+  // graceMs" pattern; the 2 s wait is acceptable latency for the
+  // guaranteed cleanup.
   return new Promise(resolve => {
-    let resolved = false;
-    const finish = () => { if (!resolved) { resolved = true; resolve(); } };
-    const timer = setTimeout(() => {
+    setTimeout(() => {
       if (groupKilled) {
         // Sweep the whole group. Don't gate on leader liveness — surviving
         // descendants (auth helpers, sidecars gemini may have spawned) still
@@ -73,17 +74,7 @@ export function terminateProcessTree(pid, { graceMs = 2000, closedPromise } = {}
       } else if (isAlive(pid)) {
         try { process.kill(pid, "SIGKILL"); } catch {}
       }
-      finish();
+      resolve();
     }, graceMs);
-    if (closedPromise) {
-      closedPromise.then(() => {
-        // Child already exited on SIGTERM. Cancel the grace timer and
-        // resolve immediately — SIGKILL is no longer needed for the
-        // leader, and any group descendants will be swept by the natural
-        // cascade since the leader's exit closes the controlling tty.
-        clearTimeout(timer);
-        finish();
-      }, () => {});
-    }
   });
 }

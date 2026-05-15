@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.5.10 — Rollback v0.5.9's two unsafe optimizations
+
+The fourth `/grok:aggregate-review` pass (against 0.5.8..0.5.9) found
+that two of the three "optimizations" introduced in 0.5.9 were actually
+regressions:
+
+- The `closedPromise` short-circuit in `terminateProcessTree` skipped
+  the SIGKILL group sweep when the leader exited cleanly on SIGTERM.
+  The justifying comment claimed descendants would cascade-die from
+  SIGHUP via the controlling tty — but `child_process.spawn` with pipe
+  stdio doesn't allocate a PTY, so SIGTERM-ignoring descendants get
+  reparented to init and run forever. All three reviewers (Codex,
+  Gemini, Grok) independently flagged this as a regression vs 0.5.8.
+- The 2 s `CONFIG_LOCK_ORPHAN_MS` for missing-pid locks introduced a
+  real race: a legitimate writer can be OS-descheduled between
+  `openSync("wx")` (which creates the visible 0-byte file) and the
+  immediately-following `writeSync(fd, pid)` for >2 s under heavy load.
+  A waiter would see the just-created lock as "orphaned" and steal it,
+  letting both writers run the read-modify-write critical section
+  concurrently.
+
+### Reverted in 0.5.10
+
+- `terminateProcessTree` no longer accepts `closedPromise`. Returns to
+  the v0.5.8 behavior: always wait the full `graceMs` (2 s default),
+  then SIGKILL the group. The 2 s wait is acceptable latency for a
+  guaranteed cleanup; the UX nit it was meant to fix (visual pause
+  between timeout message and exit) is far less harmful than leaking
+  background processes.
+- `cmdAsk`, `runJob`, and `stop-review-gate-hook` stop wiring up
+  `closedPromise`. Same `await killPromise` pattern but the kill
+  always completes its full sequence.
+- `CONFIG_LOCK_ORPHAN_MS` raised from 2_000 to 10_000 (10 s). A
+  middle ground between 2 s (too tight, missed the open/write
+  scheduling gap) and 30 s (too slow for actual orphan recovery).
+  10 s is comfortably above realistic scheduling latency on the
+  target platforms.
+
+### Kept from 0.5.9
+
+- **Strict PID regex** (`PID_STAMP_PATTERN = /^[1-9]\d*$/` in
+  `lib/state.mjs`). All three reviewers said this fix is sound — it
+  correctly rejects `"123abc"`-style garbage stamps that `parseInt`
+  would otherwise accept as `123`. No regression.
+
+### Net effect
+
+0.5.10 ≈ 0.5.8 + strict PID regex. The other "round 4" nits surfaced
+trade-offs (latency vs cleanup safety, recovery speed vs scheduling
+tolerance) where the safer choice is the slower one. Shipping safer.
+
+### Convergence note
+
+Four rounds of `/grok:aggregate-review` over 0.5.5..0.5.9. The
+findings shrank from large architectural gaps (timeouts missing,
+rescue stub) to specific nits to optimization trade-offs. v0.5.10
+restores the 0.5.8 safety guarantees while keeping the round-4 PID
+regex hardening. Further adversarial review will continue to find
+trade-off discussions but no clear-cut "broken" claims remain.
+
 ## 0.5.9 — Robustness round 4: three nits from third `/grok:aggregate-review`
 
 Third `/grok:aggregate-review` pass (against 0.5.7..0.5.8) found three
