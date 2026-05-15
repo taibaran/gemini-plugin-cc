@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.5.13 — Fix issue #4: `--scope branch` silently returned empty diff
+
+A bug report (issue #4) flagged that `/gemini:review --base <ref> --scope
+branch` always returned *"Nothing to review"* even when `git diff
+<ref>...HEAD` showed substantial changes. Discovered while running
+`/grok:aggregate-review` against grok-plugin-cc's diffs — Gemini was
+the only reviewer not producing real output.
+
+### Root cause
+
+`lib/git.mjs:52` called `git diff -- ${ref}...HEAD`. The `--` separator
+tells git that everything after is a **pathspec**, not a refspec. So
+`git diff -- HEAD~1...HEAD` was interpreted as "diff the working tree
+against itself, filtered by a path named `HEAD~1...HEAD`". That path
+doesn't exist → empty stdout, exit status **0**. The fallback (to the
+no-`--` form) only triggered on non-zero status, so the buggy form's
+empty result was silently returned.
+
+### Fix
+
+Move `--` to come AFTER the refspec: `git diff <ref>...HEAD --`. The
+trailing `--` still terminates option parsing (preserves the defense
+intent of the original code — a ref that somehow slipped past
+`isValidGitRef` + `rev-parse --verify` still can't be reinterpreted
+as a flag), but the refspec is now in refspec position. The fallback
+to the no-`--` form is preserved for older `git` versions (<2.5) that
+may not accept the trailing `--` after the `A...B` refspec form.
+
+### Test
+
+One new regression test in `tests/git.test.mjs` (99 tests total):
+spins up a temp git repo with two commits, calls `captureDiff({ scope:
+"branch", base: "HEAD~1" })`, and asserts the returned diff contains
+the actual added and removed lines. Would have caught the bug under
+the old code.
+
+### Downstream
+
+The same code pattern was copied into `taibaran/grok-plugin-cc` (and
+likely `openai/codex-plugin-cc` since both share the gemini-plugin-cc
+heritage). The reporter explicitly cross-referenced this; the
+companion repos need the same one-line fix.
+
+Closes #4.
+
 ## 0.5.12 — Test-fidelity polish + convergence
 
 Sixth (and final) `/grok:aggregate-review` pass against 0.5.10..0.5.11
