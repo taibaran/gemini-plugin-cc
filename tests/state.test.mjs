@@ -266,6 +266,49 @@ test("--timeout overflow is clamped, not silently truncated", async () => {
   assert.match(r.stderr || "", /exceeds Node's max setTimeout/);
 });
 
+test("runJob: silent-failure diagnostic fires on non-zero exit with empty buffers", async () => {
+  // Issue #3 regression guard. Previously, a Gemini process that exited
+  // non-zero without writing any stdout/stderr AND without matching
+  // classifyAuthBlob left the user with zero diagnostic output — and a
+  // rescue parent would see "no output" with no clue why. The new branch
+  // in runJob's close handler emits a structured marker pointing at
+  // /gemini:result. We exercise it by mocking gemini with a tiny shell
+  // script that exits 1 and writes nothing.
+  const { spawnSync } = await import("node:child_process");
+  const fsm = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const url = await import("node:url");
+  const here = path.dirname(url.fileURLToPath(import.meta.url));
+  const companion = path.resolve(here, "../plugins/gemini/scripts/companion.mjs");
+
+  const fakeBinDir = fsm.mkdtempSync(path.join(os.tmpdir(), "gemini-fake-bin-"));
+  const fakeGemini = path.join(fakeBinDir, "gemini");
+  fsm.writeFileSync(fakeGemini, "#!/bin/sh\nexit 1\n");
+  fsm.chmodSync(fakeGemini, 0o755);
+
+  const r = spawnSync(process.execPath, [companion, "task", "anything"], {
+    encoding: "utf8",
+    env: {
+      PATH: `${fakeBinDir}:/usr/bin:/bin`,
+      HOME: process.env.HOME || "/tmp",
+      CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA
+    }
+  });
+
+  const combined = (r.stderr || "") + (r.stdout || "");
+  assert.match(
+    combined,
+    /exited 1 with no stdout\/stderr/,
+    `Expected silent-failure diagnostic, got stderr=${r.stderr} stdout=${r.stdout}`
+  );
+  assert.match(
+    combined,
+    /\/gemini:result/,
+    "Diagnostic should point user at /gemini:result"
+  );
+});
+
 test("setActiveModel: rejects invalid model ids (defense against config tamper)", () => {
   const bad = [
     "model;rm-rf",

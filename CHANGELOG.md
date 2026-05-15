@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.5.6 — Fix issue #3: rescue subagent returns stub instead of real answer
+
+A bug report (issue #3) flagged that `Agent({ subagent_type: "gemini:gemini-rescue", ... })` returned within seconds with text like *"task forwarded to Gemini, running in background"* instead of waiting for and returning Gemini's actual answer. The underlying job's log files were 0 bytes in the silent-failure case.
+
+The report proposed three root causes; only one was correct, and the fix
+location was not where the report suggested. Codex and Gemini both
+independently verified the analysis below.
+
+### What was actually wrong
+
+- **Not the companion.** `runJob` resolves only on `proc.on("close")`;
+  `cmdTask` does `await runJob(...)`. The companion is synchronous as
+  written; `detached: true` is only for process-group kill on
+  timeout/cancel.
+- **Not the skill's `--wait` stripping.** `--wait` is in
+  `COMMON_BOOL_FLAGS` but `cmdTask` never reads `flags.wait` — it's a
+  no-op flag. Stripping it changes nothing.
+- **The rescue subagent definition itself.** `agents/gemini-rescue.md`
+  told the subagent to set `run_in_background: true` for "complicated /
+  open-ended" tasks. Claude Code's Bash tool then returned its own
+  "running in background" stub immediately, and the rescue wrapper's
+  "return stdout exactly as-is" rule forwarded that stub instead of
+  waiting for Gemini's real output.
+
+### Fix
+
+- **`agents/gemini-rescue.md`**: removed the "prefer background for long
+  tasks" branch. The subagent must always run the Bash call in the
+  foreground. Users who genuinely want background semantics call
+  `/gemini:task --background "..."` directly from the main thread.
+- **`commands/rescue.md`**: the `/gemini:rescue` slash command now
+  defaults to foreground. `--background` still works as an explicit
+  opt-out; `--wait` becomes a no-op (foreground is already the default).
+- **`skills/gemini-cli-runtime/SKILL.md`**: added an explicit
+  "foreground only" rule with a reference to issue #3 so future readers
+  understand the constraint.
+
+### Bonus: silent-failure diagnostic
+
+When Gemini exits non-zero with **both** stdout and stderr empty **and**
+no auth/quota match from `classifyAuthBlob`, `runJob` now writes a clear
+stderr message naming the job ID and pointing at `/gemini:result <id>`.
+Previously this case produced zero output — issue #3's "0-byte log file"
+mode left the user with no signal at all.
+
+### Notes for downstream wrappers
+
+If you've copied the `gemini-rescue.md` / `gemini-cli-runtime` patterns
+into another plugin (e.g., a Grok or other-LLM wrapper), apply the same
+"foreground only" change. Mirror plugins inherit the bug verbatim.
+
 ## 0.5.5 — Close-out pass: every known follow-up from 0.5.3 and 0.5.4 fixed
 
 The dual Codex+Gemini re-review of v0.5.4 surfaced two regressions I

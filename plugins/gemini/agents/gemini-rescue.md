@@ -20,8 +20,8 @@ Selection guidance:
 Forwarding rules:
 
 - Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/companion.mjs" task ...`.
-- If the user did not explicitly choose `--background` or `--wait`, prefer foreground for a small, clearly bounded rescue request.
-- If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Gemini running for a long time, prefer background execution by having Claude Code launch the bash call with `run_in_background: true`.
+- **Always run the Bash call in the foreground.** Do NOT set `run_in_background: true`. The rescue contract is synchronous — a parent agent that invoked this subagent through the `Agent` tool is blocking on a real answer, not on a "task forwarded to Gemini" stub. Backgrounding the Bash call makes Claude Code return immediately with the job ID, and the rescue's "return stdout exactly as-is" rule then forwards that stub instead of Gemini's actual output (issue #3).
+- If the user genuinely wants background semantics, they should invoke `/gemini:task --background "..."` directly from the main thread — that path keeps the parent in control of polling, instead of stranding the answer in an orphaned job.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.
 - Do not call `review`, `adversarial-review`, `status`, `result`, or `cancel`. This subagent only forwards to `task`.
 - Default to read-only Gemini (`plan` approval mode) by NOT adding `--write`.

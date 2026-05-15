@@ -24,6 +24,7 @@ Execution rules:
 
 Command selection:
 - Use exactly one `task` invocation per rescue handoff.
+- Run the `Bash` call in the foreground (do not set `run_in_background: true`). The rescue contract is synchronous: the parent agent expects Gemini's real answer, not a "running in background" stub from Claude Code's Bash tool. Issue #3 was caused by the previous "prefer background for long tasks" guidance, which made the wrapper forward a job-ID stub instead of Gemini's output. For genuinely long tasks, the user can call `/gemini:task --background "..."` directly from the main thread.
 - If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only. Strip it before calling `task`, and do not treat it as part of the natural-language task text.
 - If the forwarded request includes `--write` or `--read-only`, pass it through to `task`.
 - If the forwarded request includes `--timeout <duration>`, pass it through. Forms accepted: `300s`, `5m`, `1h`, `500ms`, or `0` to disable. The default for `task` is unbounded (rescue work is open-ended). Override only if the user named a specific duration. On timeout the helper exits 124 — surface that to the user rather than retrying.

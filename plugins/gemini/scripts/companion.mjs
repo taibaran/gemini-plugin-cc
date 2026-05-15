@@ -341,6 +341,20 @@ function runJob({ args, meta, stdin = null, showStdout = true, timeoutMs = 0 }) 
         if (errBuf) process.stderr.write(sanitizeForTerminal(errBuf));
         const why = classifyAuthBlob(outBuf + "\n" + errBuf);
         if (why) process.stderr.write(`\n[hint: ${why}. Run /gemini:setup.]\n`);
+        // Silent-failure diagnostic. Without this, a non-zero exit with empty
+        // stdout/stderr AND no auth-blob match used to surface zero output —
+        // the user saw a failed job they couldn't debug, and a rescue parent
+        // would see "no output" with no clue why. Surface a structured marker
+        // so the user knows the process ran, died with no I/O, and where to
+        // look. Issue #3's "0-byte log file" failure mode.
+        if (!errBuf && !outBuf && !why) {
+          process.stderr.write(
+            `\n[gemini-plugin] Job ${meta.id} exited ${code} with no stdout/stderr. ` +
+            `Likely causes: SIGKILL before any I/O, immediate crash, auth/connectivity ` +
+            `error not matched by the classifier, or sandbox restriction. ` +
+            `Inspect: /gemini:result ${meta.id}\n`
+          );
+        }
       }
 
       resolve({ code, outBuf, errBuf, timedOut });
