@@ -235,6 +235,11 @@ async function cmdAsk({ flags, positional }) {
     let timedOut = false;
     let killPromise = null;
     const sanitizer = new TerminalSanitizer();
+    // Resolves when proc closes — lets terminateProcessTree cancel its
+    // SIGKILL grace timer early once the child has actually exited on
+    // SIGTERM, instead of always waiting the full 2 s.
+    let closedResolve;
+    const closedPromise = new Promise(r => { closedResolve = r; });
 
     proc.stdout.on("data", d => {
       const safe = sanitizer.push(d);
@@ -255,21 +260,26 @@ async function cmdAsk({ flags, positional }) {
         if (proc.exitCode !== null || proc.signalCode !== null) return;
         timedOut = true;
         // Emit the timeout message SYNCHRONOUSLY here, not in the close
-        // handler. The close handler may take up to 2s+graceMs because it
+        // handler. The close handler may take up to graceMs because it
         // awaits killPromise — leaving the user staring at a blank terminal
-        // for the full deadline + SIGKILL grace before any feedback.
-        // The old spawnSync({timeout}) path returned ETIMEDOUT immediately;
-        // matching that UX requires the user-facing message to fire now.
+        // before any feedback. The old spawnSync({timeout}) path returned
+        // ETIMEDOUT immediately; matching that UX requires the user-facing
+        // message to fire now.
         process.stderr.write(`\n[gemini-plugin] ask timed out after ${timeoutMs}ms. Re-run with --timeout 0 to disable, or pick a longer duration like --timeout 15m.\n`);
-        killPromise = terminateProcessTree(proc.pid).catch(() => {});
+        killPromise = terminateProcessTree(proc.pid, { closedPromise }).catch(() => {});
       }, timeoutMs);
     }
 
     proc.on("close", async code => {
       if (timer) clearTimeout(timer);
+      // Signal terminateProcessTree that the child has closed so it can
+      // cancel its grace timer instead of waiting the full graceMs.
+      closedResolve();
       // Await the kill sequence so the inner SIGKILL has a chance to fire
       // before process.exit cancels it. Without this await, a Gemini child
-      // that ignores SIGTERM would survive past `ask` returning.
+      // that ignores SIGTERM would survive past `ask` returning. With the
+      // closedPromise wiring above, this typically returns almost
+      // immediately when the child cooperated with SIGTERM.
       if (killPromise) await killPromise;
       const tail = sanitizer.flush();
       if (tail) process.stdout.write(tail);
@@ -346,6 +356,10 @@ function runJob({ args, meta, stdin = null, showStdout = true, timeoutMs = 0 }) 
     // timer inside terminateProcessTree and SIGTERM-ignoring descendants
     // survive past the supposed cleanup. Same pattern stop-hook uses.
     let killPromise = null;
+    // Resolves on proc close — gives terminateProcessTree a way to skip
+    // the full graceMs wait when the child has already exited cleanly.
+    let closedResolve;
+    const closedPromise = new Promise(r => { closedResolve = r; });
     if (timeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
         // The process may have exited cleanly between when the timer was
@@ -362,7 +376,7 @@ function runJob({ args, meta, stdin = null, showStdout = true, timeoutMs = 0 }) 
         meta.status = "timed-out";
         meta.ended_at = new Date().toISOString();
         try { writeJobMeta(meta.id, meta); } catch {}
-        killPromise = terminateProcessTree(proc.pid).catch(() => {});
+        killPromise = terminateProcessTree(proc.pid, { closedPromise }).catch(() => {});
       }, timeoutMs);
     }
 
@@ -385,6 +399,9 @@ function runJob({ args, meta, stdin = null, showStdout = true, timeoutMs = 0 }) 
 
     proc.on("close", async code => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
+      // Signal terminateProcessTree's closedPromise so it can cancel its
+      // SIGKILL grace timer rather than waiting the full graceMs.
+      closedResolve();
       // Await SIGKILL escalation BEFORE closing fds / emitting status so
       // that any descendants the leader spawned get fully cleaned up.
       // Same async-close pattern stop-hook and cmdAsk use.

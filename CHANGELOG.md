@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.5.9 — Robustness round 4: three nits from third `/grok:aggregate-review`
+
+Third `/grok:aggregate-review` pass (against 0.5.7..0.5.8) found three
+genuine UX/correctness gaps the prior round missed. Smaller than round 3
+but all defensible.
+
+### Fixes
+
+- **PID regex now strict** (Codex).
+  `parseInt("123abc", 10)` returns `123` — a half-written or
+  corrupted lock stamp like `${pid}garbage` would parse as a valid pid,
+  and if that integer happened to reference a live unrelated process,
+  the lock would never be reclaimed. New `PID_STAMP_PATTERN = /^[1-9]\d*$/`
+  requires the entire content to be a positive decimal pid.
+
+- **`terminateProcessTree` can now skip the full 2 s grace when the
+  child has already exited** (Gemini).
+  When SIGTERM kills the child cleanly in <50 ms, the prior code still
+  waited the full 2 s before letting the close handler proceed. User
+  saw the timeout message instantly, then a 2 s blank pause, then any
+  remaining child output. New optional `closedPromise` parameter lets
+  callers signal that the child has closed; on signal, the grace timer
+  cancels and the Promise resolves immediately. SIGKILL still fires
+  via the normal path when the child genuinely ignores SIGTERM.
+  Wired through `cmdAsk`, `runJob`, and `stop-review-gate-hook` — all
+  three callers now construct a `closedResolve` Promise from their
+  `proc.on("close")` handler.
+
+- **0-byte / malformed lock window shortened to 2 s** (Gemini).
+  v0.5.8 fell back to the 30 s `CONFIG_LOCK_STALE_MS` for the
+  no-PID-stamp case, but a healthy writer cannot leave a 0-byte file
+  for more than microseconds (writeSync is synchronous). So if a
+  0-byte lock has been sitting for 2 s, the writer is definitely gone.
+  New `CONFIG_LOCK_ORPHAN_MS = 2_000` for the missing-pid path; the
+  full 30 s window is preserved for the dead-pid case where mtime
+  alone can't distinguish a freshly-created lock from a stale one.
+
+### Tests
+
+- 98 tests unchanged; the v0.5.8 `withConfigLock: reclaims a 0-byte /
+  malformed lock` test now runs ~28 s faster (mtime delta of 10 min
+  still satisfies the 2 s window).
+
+### Not changed (deliberate)
+
+- `/gemini:cancel` and `session-lifecycle-hook` still gate on
+  `isAlive(meta.pid)` rather than always calling `terminateProcessTree`.
+  Codex flagged this as a residual gap for the dead-leader-live-group
+  case via user-facing recovery commands. Out of scope for this round —
+  it changes the cancel/reap UX semantics for a edge case that the
+  runtime cleanup paths (runJob, cmdAsk, stop-hook) already handle.
+  Tracked for a future round if the failure mode actually appears.
+
 ## 0.5.8 — Robustness round 3: five findings from second `/grok:aggregate-review`
 
 Ran `/grok:aggregate-review` again, this time against the 0.5.6..0.5.7 diff

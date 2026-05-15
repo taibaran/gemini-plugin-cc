@@ -146,13 +146,18 @@ function main() {
   // survive past the supposed cleanup. The await guarantees the group-kill
   // sequence completes before we relinquish control.
   let killPromise = null;
+  // Resolves on proc close — lets terminateProcessTree cancel its grace
+  // timer early if the child cooperated with SIGTERM.
+  let closedResolve;
+  const closedPromise = new Promise(r => { closedResolve = r; });
   const timer = setTimeout(() => {
     timedOut = true;
-    killPromise = terminateProcessTree(proc.pid).catch(() => {});
+    killPromise = terminateProcessTree(proc.pid, { closedPromise }).catch(() => {});
   }, HOOK_TIMEOUT_MS);
 
   proc.on("close", async code => {
     clearTimeout(timer);
+    closedResolve();
     if (killPromise) {
       await killPromise;
     }

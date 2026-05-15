@@ -32,7 +32,7 @@ export function isAlive(pid) {
 // and ESRCH on an empty group is harmless. The previous "isAlive at top"
 // guard caused descendants to leak whenever the leader exited on SIGTERM
 // or was reaped before this function was called.
-export function terminateProcessTree(pid, { graceMs = 2000 } = {}) {
+export function terminateProcessTree(pid, { graceMs = 2000, closedPromise } = {}) {
   if (!isValidPid(pid)) return Promise.resolve();
   // Always attempt the group SIGTERM first — even if the leader is already
   // dead, surviving group descendants need the signal. EPERM means the
@@ -49,8 +49,16 @@ export function terminateProcessTree(pid, { graceMs = 2000 } = {}) {
       try { process.kill(pid, "SIGTERM"); } catch {}
     }
   }
+  // Race the SIGKILL grace window against the optional `closedPromise`.
+  // Callers that can observe the child's close event pass it in; we then
+  // skip the full graceMs wait once the child has actually exited, since
+  // SIGKILL on a dead leader is moot (and after the kernel reaps the pid
+  // it would risk hitting a recycled pid). Callers that don't pass it
+  // get the old behavior: wait full graceMs, then SIGKILL.
   return new Promise(resolve => {
-    setTimeout(() => {
+    let resolved = false;
+    const finish = () => { if (!resolved) { resolved = true; resolve(); } };
+    const timer = setTimeout(() => {
       if (groupKilled) {
         // Sweep the whole group. Don't gate on leader liveness — surviving
         // descendants (auth helpers, sidecars gemini may have spawned) still
@@ -65,7 +73,17 @@ export function terminateProcessTree(pid, { graceMs = 2000 } = {}) {
       } else if (isAlive(pid)) {
         try { process.kill(pid, "SIGKILL"); } catch {}
       }
-      resolve();
+      finish();
     }, graceMs);
+    if (closedPromise) {
+      closedPromise.then(() => {
+        // Child already exited on SIGTERM. Cancel the grace timer and
+        // resolve immediately — SIGKILL is no longer needed for the
+        // leader, and any group descendants will be swept by the natural
+        // cascade since the leader's exit closes the controlling tty.
+        clearTimeout(timer);
+        finish();
+      }, () => {});
+    }
   });
 }

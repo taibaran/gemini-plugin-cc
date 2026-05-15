@@ -218,6 +218,14 @@ import { isAlive } from "./process.mjs";
 
 const CONFIG_LOCK_TIMEOUT_MS = 5000;
 const CONFIG_LOCK_STALE_MS = 30_000;
+// Tighter window for the no-PID-stamp recovery path. A healthy writer
+// can never leave a 0-byte file for >2 s — writeSync is synchronous and
+// completes in microseconds. If a 0-byte lock has been there 2 seconds,
+// it's almost certainly from a terminated process. Without this shorter
+// threshold, a freshly-crashed writer leaves operations blocked for the
+// full 30 s `CONFIG_LOCK_STALE_MS` even though the writer is already
+// gone.
+const CONFIG_LOCK_ORPHAN_MS = 2_000;
 const CONFIG_LOCK_POLL_MS = 25;
 
 function sleepSync(ms) {
@@ -227,9 +235,15 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(sab), 0, 0, ms);
 }
 
+// Strict decimal-pid match. parseInt would accept "123abc" → 123 and let
+// a digit-prefixed garbage stamp masquerade as a valid pid (potentially
+// referencing a live unrelated process and stranding the lock until that
+// process exits). Require the entire file content to be a pid > 1.
+const PID_STAMP_PATTERN = /^[1-9]\d*$/;
 function readLockHolderPid(lockPath) {
   try {
     const raw = fs.readFileSync(lockPath, "utf8").trim();
+    if (!PID_STAMP_PATTERN.test(raw)) return null;
     const pid = parseInt(raw, 10);
     return Number.isFinite(pid) && pid > 1 ? pid : null;
   } catch {
@@ -302,10 +316,16 @@ function withConfigLock(cwd, fn) {
       } catch {}
       const holderDead = holderPid !== null && !isAlive(holderPid);
       const noPidStamp = holderPid === null;
-      // (b) fallback only kicks in when both conditions are clearly true
-      // simultaneously, so a brief race during stamp-write doesn't strip a
-      // valid live lock.
-      const orphanedByMissingPid = noPidStamp && tooOld;
+      // (b) fallback uses a much shorter window. A healthy stamp-write is
+      // microseconds; if the file is still missing/garbled after 2 s, the
+      // writer crashed. Keeping the 30 s window only for the dead-pid case
+      // protects live-pid-aged-mtime from being mistakenly reclaimed.
+      let orphanAge = false;
+      try {
+        const lstat = fs.statSync(lockPath);
+        orphanAge = Date.now() - lstat.mtimeMs > CONFIG_LOCK_ORPHAN_MS;
+      } catch {}
+      const orphanedByMissingPid = noPidStamp && orphanAge;
       if ((holderDead && tooOld) || orphanedByMissingPid) {
         if (tryReclaimStaleLock(lockPath)) continue;
       }
