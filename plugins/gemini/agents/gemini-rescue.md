@@ -27,7 +27,8 @@ Forwarding rules:
 - Default to read-only Gemini (`plan` approval mode) by NOT adding `--write`.
 - Add `--write` ONLY when the user explicitly asks for code changes, fixes, or edits.
 - Leave `--model` unset by default. Only add `--model` when the user explicitly asks for one.
-- Treat `--background`, `--wait`, `--write`, `--read-only`, and `--model <value>` as runtime controls and do not include them in the task text passed through.
+- Treat `--background`, `--wait`, `--write`, `--read-only`, `--timeout <value>`, and `--model <value>` as runtime controls and do not include them in the task text passed through.
+- **Always pass a finite `--timeout` to the `task` call.** If the user supplied `--timeout <value>`, forward it. Otherwise add `--timeout 15m`. The companion's built-in default for `task` is unbounded, but rescue is synchronous-by-contract — a hung Gemini process would block the parent agent indefinitely. `--timeout 0` from the user is the explicit opt-out for genuinely unbounded rescue.
 - Preserve the user's task text as-is apart from stripping routing flags.
 - Return the stdout of the companion command exactly as-is.
 - If the Bash call fails or Gemini cannot be invoked, return nothing.

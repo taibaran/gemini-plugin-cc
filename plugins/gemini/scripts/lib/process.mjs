@@ -25,6 +25,12 @@ export function isAlive(pid) {
 // After the grace window, escalate to SIGKILL. Returns a Promise that resolves
 // after the SIGKILL escalation step — callers MUST await this before exiting,
 // otherwise the timer is cancelled by process.exit and SIGKILL never fires.
+//
+// Group-kill SIGKILL is unconditional: the previous version only sent SIGKILL
+// if `isAlive(pid)` was still true at the grace mark, which silently let
+// surviving descendants leak when the group leader died from SIGTERM but
+// children kept running. Now group SIGKILL always fires (ESRCH on an
+// already-empty group is harmless and swallowed).
 export function terminateProcessTree(pid, { graceMs = 2000 } = {}) {
   if (!isValidPid(pid) || !isAlive(pid)) return Promise.resolve();
   let groupKilled = false;
@@ -36,14 +42,19 @@ export function terminateProcessTree(pid, { graceMs = 2000 } = {}) {
   }
   return new Promise(resolve => {
     setTimeout(() => {
-      if (isAlive(pid)) {
-        if (groupKilled) {
-          try { process.kill(-pid, "SIGKILL"); } catch {
+      if (groupKilled) {
+        // Sweep the whole group. Don't gate on leader liveness — surviving
+        // descendants (auth helpers, sidecars gemini may have spawned) still
+        // need the kill even after the leader exits on SIGTERM.
+        try { process.kill(-pid, "SIGKILL"); } catch {
+          // ESRCH is fine: group already empty. Fall back to direct pid
+          // SIGKILL only if the leader itself is still alive.
+          if (isAlive(pid)) {
             try { process.kill(pid, "SIGKILL"); } catch {}
           }
-        } else {
-          try { process.kill(pid, "SIGKILL"); } catch {}
         }
+      } else if (isAlive(pid)) {
+        try { process.kill(pid, "SIGKILL"); } catch {}
       }
       resolve();
     }, graceMs);

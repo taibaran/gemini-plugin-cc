@@ -203,10 +203,19 @@ export function writeConfig(cwd, config) {
 //
 // Implementation notes:
 //   - O_EXCL via "wx" gives us a primitive `try-acquire`.
-//   - Stale locks (>30s old, >100x the worst-case operation time) are
-//     reclaimed automatically so a SIGKILL'd caller doesn't strand the lock.
+//   - We write the holder process's PID into the lock file on acquire so
+//     stale recovery can verify the holder is genuinely dead (NTP-style
+//     clock adjustments that move mtime backwards no longer falsely look
+//     "stale" — pid liveness is the source of truth).
+//   - Reclaiming a dead holder's lock uses `renameSync` to a unique path
+//     instead of `unlinkSync`. rename is atomic and first-rename-wins:
+//     two waiters that both see a dead holder can't both succeed in
+//     reclaiming, which closes the prior TOCTOU where two unlinks raced
+//     and one process unlinked another's freshly-created lock.
 //   - Atomics.wait gives a real synchronous sleep without busy-waiting,
 //     which we need because setReviewGate / setActiveModel are sync.
+import { isAlive } from "./process.mjs";
+
 const CONFIG_LOCK_TIMEOUT_MS = 5000;
 const CONFIG_LOCK_STALE_MS = 30_000;
 const CONFIG_LOCK_POLL_MS = 25;
@@ -218,6 +227,46 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(sab), 0, 0, ms);
 }
 
+function readLockHolderPid(lockPath) {
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8").trim();
+    const pid = parseInt(raw, 10);
+    return Number.isFinite(pid) && pid > 1 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+function tryReclaimStaleLock(lockPath) {
+  // Use rename to atomically claim the right to delete a stale lock.
+  // First rename wins; subsequent attempts get ENOENT and loop into the
+  // normal acquire path. This is the TOCTOU fix: two waiters can't both
+  // unlink the same lock file and then race to create new ones.
+  const reclaimPath = `${lockPath}.reclaim-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    fs.renameSync(lockPath, reclaimPath);
+  } catch {
+    return false;  // someone else reclaimed first, or it's already gone
+  }
+  // Re-confirm the holder is dead inside the quarantined copy before
+  // discarding (the rename happened, but if a live holder somehow had
+  // the same dead-looking pid via reuse we'd rather not destroy their
+  // record).
+  const stillDead = (() => {
+    const pid = readLockHolderPid(reclaimPath);
+    if (pid === null) return true;
+    return !isAlive(pid);
+  })();
+  if (stillDead) {
+    try { fs.unlinkSync(reclaimPath); } catch {}
+    return true;
+  }
+  // Live holder showed up under the same pid (unlikely but possible).
+  // Restore the lock and back off.
+  try { fs.renameSync(reclaimPath, lockPath); } catch {}
+  return false;
+}
+
 function withConfigLock(cwd, fn) {
   const dir = stateDir(cwd);
   ensureDir(dir);
@@ -227,16 +276,26 @@ function withConfigLock(cwd, fn) {
   while (Date.now() - start < CONFIG_LOCK_TIMEOUT_MS) {
     try {
       fd = fs.openSync(lockPath, "wx", 0o600);
+      // Stamp our PID so a future stale check can verify liveness.
+      try { fs.writeSync(fd, String(process.pid)); } catch {}
       break;
     } catch (e) {
       if (e.code !== "EEXIST") throw e;
+      // Holder exists. Reclaim ONLY if pid is genuinely dead AND age is
+      // beyond the stale window. Either alone is insufficient: a live
+      // process under load can age past the window, and a freshly-created
+      // lock can have a stale mtime under clock skew. Both conditions
+      // together signal an abandoned lock.
+      const holderPid = readLockHolderPid(lockPath);
+      const holderDead = holderPid !== null && !isAlive(holderPid);
+      let tooOld = false;
       try {
         const lstat = fs.statSync(lockPath);
-        if (Date.now() - lstat.mtimeMs > CONFIG_LOCK_STALE_MS) {
-          fs.unlinkSync(lockPath);
-          continue;
-        }
+        tooOld = Date.now() - lstat.mtimeMs > CONFIG_LOCK_STALE_MS;
       } catch {}
+      if (holderDead && tooOld) {
+        if (tryReclaimStaleLock(lockPath)) continue;
+      }
       sleepSync(CONFIG_LOCK_POLL_MS);
     }
   }

@@ -266,6 +266,53 @@ test("--timeout overflow is clamped, not silently truncated", async () => {
   assert.match(r.stderr || "", /exceeds Node's max setTimeout/);
 });
 
+test("withConfigLock: a fresh lock can be reclaimed only after the holder pid dies", async () => {
+  // 0.5.7 hardening: stale-lock recovery uses pid liveness instead of mtime
+  // alone, so a fresh lock holding a LIVE pid must not be reclaimed by a
+  // waiter — even if mtime is artificially aged (e.g., NTP clock skew that
+  // pushes mtime back past the stale window). Conversely, a lock holding a
+  // dead pid AND aged mtime must be reclaimable. We exercise both.
+  const path = await import("node:path");
+  const dir = stateDir(process.cwd());
+  const lockPath = path.join(dir, "config.json.lock");
+
+  // 1. Live holder, even with backdated mtime: a 2-second acquire timeout
+  //    from a separate child must fail rather than steal the lock.
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(lockPath, String(process.pid));
+  const oldTime = new Date(Date.now() - 10 * 60_000);  // 10 min ago
+  fs.utimesSync(lockPath, oldTime, oldTime);
+  const { spawnSync } = await import("node:child_process");
+  const url = await import("node:url");
+  const here = path.dirname(url.fileURLToPath(import.meta.url));
+  const acquireScript = `
+    process.env.CLAUDE_PLUGIN_DATA = ${JSON.stringify(process.env.CLAUDE_PLUGIN_DATA)};
+    import("${path.resolve(here, "../plugins/gemini/scripts/lib/state.mjs").replace(/\\/g, "/")}")
+      .then(m => m.setReviewGate(process.cwd(), true))
+      .then(() => process.exit(0))
+      .catch(() => process.exit(1));
+  `;
+  const liveHolderResult = spawnSync(process.execPath, ["-e", acquireScript], {
+    encoding: "utf8",
+    env: { ...process.env, CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA },
+    timeout: 7000
+  });
+  // The waiter should have failed to acquire (exit 1) because the live holder
+  // pid kept the lock, despite the aged mtime.
+  assert.notEqual(liveHolderResult.status, 0, "Live holder's lock should not be reclaimed despite stale mtime");
+
+  // 2. Dead holder + aged mtime: reclaim succeeds.
+  fs.writeFileSync(lockPath, "999999999");  // very-likely-dead pid
+  fs.utimesSync(lockPath, oldTime, oldTime);
+  const deadHolderResult = spawnSync(process.execPath, ["-e", acquireScript], {
+    encoding: "utf8",
+    env: { ...process.env, CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA },
+    timeout: 7000
+  });
+  assert.equal(deadHolderResult.status, 0,
+    `Dead holder's lock should be reclaimable. stderr=${deadHolderResult.stderr} stdout=${deadHolderResult.stdout}`);
+});
+
 test("runJob: silent-failure diagnostic fires on non-zero exit with empty buffers", async () => {
   // Issue #3 regression guard. Previously, a Gemini process that exited
   // non-zero without writing any stdout/stderr AND without matching

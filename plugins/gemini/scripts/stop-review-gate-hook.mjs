@@ -140,18 +140,22 @@ function main() {
     }
   });
 
+  // Hold the kill promise so the close handler can await it before exiting.
+  // Without this, emitInfraFailure() → process.exit() cancels the pending
+  // SIGKILL timer inside terminateProcessTree, and SIGTERM-ignoring children
+  // survive past the supposed cleanup. The await guarantees the group-kill
+  // sequence completes before we relinquish control.
+  let killPromise = null;
   const timer = setTimeout(() => {
     timedOut = true;
-    // SIGTERM the process group, escalate to SIGKILL after the grace window.
-    // Previous version called proc.kill("SIGTERM") which targets only the
-    // direct child — any subprocesses gemini spawned (auth helpers,
-    // language-server-like sidecars) survived as orphans, and a child
-    // ignoring SIGTERM never escalated. terminateProcessTree handles both.
-    terminateProcessTree(proc.pid).catch(() => {});
+    killPromise = terminateProcessTree(proc.pid).catch(() => {});
   }, HOOK_TIMEOUT_MS);
 
-  proc.on("close", code => {
+  proc.on("close", async code => {
     clearTimeout(timer);
+    if (killPromise) {
+      await killPromise;
+    }
     if (timedOut) {
       emitInfraFailure("review gate timed out");
     }

@@ -193,7 +193,7 @@ function cmdSetup({ flags }) {
 
 // ---------- subcommand: ask ----------
 
-function cmdAsk({ flags, positional }) {
+async function cmdAsk({ flags, positional }) {
   const prompt = positional.join(" ").trim();
   if (!prompt) {
     console.error("Usage: ask <question>");
@@ -208,25 +208,77 @@ function cmdAsk({ flags, positional }) {
     process.exit(127);
   }
   const args = ["-p", prompt, ...geminiBaseArgs({ readOnly: true, model: flags.model })];
-  const spawnOpts = { encoding: "utf8", env: cleanGeminiEnv() };
-  // spawnSync's `timeout` SIGTERMs the child after the deadline; r.error.code
-  // becomes ETIMEDOUT so we can distinguish a timeout from a normal failure.
-  // Same setTimeout-overflow concern as runJob: clamp via resolveTimeoutMs.
-  if (timeoutMs > 0) spawnOpts.timeout = Math.min(timeoutMs, MAX_SETTIMEOUT_MS);
-  const r = spawnSync("gemini", args, spawnOpts);
-  if (r.error && r.error.code === "ETIMEDOUT") {
-    if (r.stdout) process.stdout.write(sanitizeForTerminal(r.stdout));
-    if (r.stderr) process.stderr.write(sanitizeForTerminal(r.stderr));
-    process.stderr.write(`\n[gemini-plugin] ask timed out after ${timeoutMs}ms. Re-run with --timeout 0 to disable, or pick a longer duration like --timeout 15m.\n`);
-    process.exit(EXIT_TIMEOUT);
-  }
-  process.stdout.write(sanitizeForTerminal(r.stdout || ""));
-  if (r.status !== 0) {
-    if (r.stderr) process.stderr.write(sanitizeForTerminal(r.stderr));
-    const why = classifyAuthBlob((r.stdout || "") + "\n" + (r.stderr || ""));
-    if (why) process.stderr.write(`\n[hint: ${why}. Run /gemini:setup.]\n`);
-  }
-  process.exit(r.status ?? 0);
+
+  // Use async spawn + detached + terminateProcessTree so timeouts get the
+  // same SIGTERM-group → SIGKILL-group escalation that review/task/stop-hook
+  // use. The previous spawnSync({ timeout }) path could only SIGTERM the
+  // direct child and never escalated to SIGKILL, leaving orphan descendants
+  // and a non-killable Gemini surviving past the deadline.
+  return new Promise(resolve => {
+    const proc = spawn("gemini", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+      env: cleanGeminiEnv()
+    });
+
+    let outBuf = "";
+    let errBuf = "";
+    let timedOut = false;
+    let killPromise = null;
+    const sanitizer = new TerminalSanitizer();
+
+    proc.stdout.on("data", d => {
+      const safe = sanitizer.push(d);
+      if (safe) process.stdout.write(safe);
+      if (outBuf.length < MAX_JOB_BUF) {
+        outBuf += d.toString().slice(0, MAX_JOB_BUF - outBuf.length);
+      }
+    });
+    proc.stderr.on("data", d => {
+      if (errBuf.length < MAX_JOB_BUF) {
+        errBuf += d.toString().slice(0, MAX_JOB_BUF - errBuf.length);
+      }
+    });
+
+    let timer = null;
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        if (proc.exitCode !== null || proc.signalCode !== null) return;
+        timedOut = true;
+        killPromise = terminateProcessTree(proc.pid).catch(() => {});
+      }, timeoutMs);
+    }
+
+    proc.on("close", async code => {
+      if (timer) clearTimeout(timer);
+      // Await the kill sequence so the inner SIGKILL has a chance to fire
+      // before process.exit cancels it. Without this await, a Gemini child
+      // that ignores SIGTERM would survive past `ask` returning.
+      if (killPromise) await killPromise;
+      const tail = sanitizer.flush();
+      if (tail) process.stdout.write(tail);
+      if (timedOut) {
+        if (errBuf) process.stderr.write(sanitizeForTerminal(errBuf));
+        process.stderr.write(`\n[gemini-plugin] ask timed out after ${timeoutMs}ms. Re-run with --timeout 0 to disable, or pick a longer duration like --timeout 15m.\n`);
+        resolve();
+        process.exit(EXIT_TIMEOUT);
+      }
+      if (code !== 0) {
+        if (errBuf) process.stderr.write(sanitizeForTerminal(errBuf));
+        const why = classifyAuthBlob(outBuf + "\n" + errBuf);
+        if (why) process.stderr.write(`\n[hint: ${why}. Run /gemini:setup.]\n`);
+      }
+      resolve();
+      process.exit(code ?? 0);
+    });
+
+    proc.on("error", err => {
+      if (timer) clearTimeout(timer);
+      process.stderr.write(`Failed to spawn gemini: ${err.message}\n`);
+      resolve();
+      process.exit(127);
+    });
+  });
 }
 
 // ---------- shared job runner ----------
@@ -720,7 +772,7 @@ async function main() {
   }
   switch (sub) {
     case "setup": return cmdSetup(args);
-    case "ask": return cmdAsk(args);
+    case "ask": return await cmdAsk(args);
     case "review": return await cmdReview(args, { adversarial: false });
     case "adversarial-review": return await cmdReview(args, { adversarial: true });
     case "task": return await cmdTask(args);

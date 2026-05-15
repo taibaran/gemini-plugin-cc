@@ -1,5 +1,85 @@
 # Changelog
 
+## 0.5.7 — Robustness round 2: four findings from `/grok:aggregate-review`
+
+Ran the multi-LLM `/grok:aggregate-review` (Codex + Gemini + Grok in parallel)
+against the full 0.5.3..0.5.6 diff with adversarial framing. The aggregated
+pass surfaced four real issues that earlier single-reviewer rounds missed,
+including one new regression introduced by the 0.5.6 fix itself.
+
+### Fixes
+
+- **Rescue can no longer block the parent agent indefinitely** (regression from 0.5.6).
+  Codex flagged: the 0.5.6 "always foreground" fix combined with
+  `DEFAULT_TASK_TIMEOUT_MS = 0` meant a hung Gemini would strand the parent
+  forever. The rescue subagent's contract was synchronous-by-design without
+  any deadline.
+  - `skills/gemini-cli-runtime/SKILL.md`: rescue MUST add `--timeout 15m`
+    when the user didn't supply one. Users opt out of the cap with
+    `--timeout 0` explicitly.
+  - `agents/gemini-rescue.md`: same rule, mirrored. The previous "leave
+    timeout alone" behavior is replaced by an explicit always-bound
+    contract.
+  - `task`'s built-in default (unbounded) is unchanged for direct
+    `/gemini:task` callers — only rescue is bounded by default.
+
+- **stop-hook SIGKILL escalation now actually fires** (Codex).
+  The 0.5.5 fix called `terminateProcessTree(proc.pid).catch(() => {})`
+  without awaiting it, and the close handler's `emitInfraFailure()` →
+  `process.exit(0)` cancelled the pending 2 s SIGKILL timer before it
+  could escalate. SIGTERM-ignoring children survived.
+  - `stop-review-gate-hook.mjs`: timer now stores the kill Promise; the
+    close handler is async and awaits it before exiting.
+  - `lib/process.mjs:terminateProcessTree`: group SIGKILL is now
+    unconditional when SIGTERM was sent to the group. The previous
+    `if (isAlive(pid))` guard skipped SIGKILL when the leader died on
+    SIGTERM but the group still had surviving descendants — exactly the
+    case the escalation was meant to handle. ESRCH on an empty group is
+    swallowed; pid-only-kill paths still gate on liveness as before.
+
+- **`config.json` lock TOCTOU closed** (Codex + Gemini).
+  The 0.5.5 lock used mtime-only stale detection, so two waiters could
+  both see an aged lock, both unlink it, and the second unlink would
+  destroy the fresh lock the first just created. Clock skew (NTP moving
+  the wall clock backward) could also make a live holder's lock look
+  stale.
+  - `lib/state.mjs`: lock file now carries the holder's PID. Stale
+    recovery checks `!isAlive(holderPid) AND age > stale_window` — both
+    conditions required. Live holders survive aged-mtime cases.
+  - Reclaim of a dead lock uses `renameSync` to a unique quarantine
+    path instead of `unlinkSync`. First rename wins; concurrent
+    reclaimers see ENOENT and loop back into the normal acquire path,
+    which closes the old TOCTOU.
+
+- **`cmdAsk --timeout` now does SIGTERM → SIGKILL escalation like
+  every other timeout path** (Gemini).
+  `cmdAsk` was the only timeout-bearing subcommand still using
+  `spawnSync({ timeout })`, which kills only the direct child with
+  SIGTERM and never escalates to SIGKILL. The README claimed uniform
+  termination semantics that didn't hold for `ask`.
+  - Rewrote `cmdAsk` to use async `spawn(..., { detached: true })`
+    plus `terminateProcessTree` (matching `runJob` and the stop-hook).
+    The timer callback also guards against the firing-after-clean-exit
+    race that 0.5.5 introduced for `runJob`. Same exit code semantics
+    (124 on timeout).
+  - `case "ask"` in the dispatcher is now awaited.
+
+### Tests
+
+- 1 new test brings the suite to **97 total**:
+  - `withConfigLock: a fresh lock can be reclaimed only after the
+    holder pid dies` — two child-process scenarios:
+    (a) live holder + aged mtime → waiter cannot reclaim;
+    (b) dead pid + aged mtime → waiter reclaims successfully.
+
+### Out of scope (deliberate)
+
+- The 15 m rescue cap is opinionated. Tasks that genuinely need longer
+  should use `/gemini:task --background "..."` directly from the main
+  thread (no subagent involved), or pass `--timeout 0`. The rescue
+  contract is "block the parent agent for a real answer" — unbounded
+  blocking defeats the purpose.
+
 ## 0.5.6 — Fix issue #3: rescue subagent returns stub instead of real answer
 
 A bug report (issue #3) flagged that `Agent({ subagent_type: "gemini:gemini-rescue", ... })` returned within seconds with text like *"task forwarded to Gemini, running in background"* instead of waiting for and returning Gemini's actual answer. The underlying job's log files were 0 bytes in the silent-failure case.
