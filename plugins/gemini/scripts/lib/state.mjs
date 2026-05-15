@@ -251,7 +251,9 @@ function tryReclaimStaleLock(lockPath) {
   // Re-confirm the holder is dead inside the quarantined copy before
   // discarding (the rename happened, but if a live holder somehow had
   // the same dead-looking pid via reuse we'd rather not destroy their
-  // record).
+  // record). A missing/unparseable PID is treated as dead — we only
+  // reach this branch when the caller already decided the lock was
+  // orphaned (either dead-pid or no-pid-stamp + aged mtime).
   const stillDead = (() => {
     const pid = readLockHolderPid(reclaimPath);
     if (pid === null) return true;
@@ -281,19 +283,30 @@ function withConfigLock(cwd, fn) {
       break;
     } catch (e) {
       if (e.code !== "EEXIST") throw e;
-      // Holder exists. Reclaim ONLY if pid is genuinely dead AND age is
-      // beyond the stale window. Either alone is insufficient: a live
-      // process under load can age past the window, and a freshly-created
-      // lock can have a stale mtime under clock skew. Both conditions
-      // together signal an abandoned lock.
+      // Holder exists. Reclaim if any of:
+      //   (a) PID is parseable AND the process is dead AND mtime is stale.
+      //       Two conditions together — a live process under load can age
+      //       past the window, and a freshly-created lock can have a stale
+      //       mtime under clock skew (NTP adjustment), so neither alone
+      //       is sufficient.
+      //   (b) Lock file has no parseable PID (empty / partial write /
+      //       legacy v0.5.6 lock) AND mtime is stale. Without this
+      //       fallback, a crash between `openSync("wx")` and `writeSync`
+      //       leaves a 0-byte lock that's permanently unrecoverable —
+      //       worse than the v0.5.5 mtime-only behavior we replaced.
       const holderPid = readLockHolderPid(lockPath);
-      const holderDead = holderPid !== null && !isAlive(holderPid);
       let tooOld = false;
       try {
         const lstat = fs.statSync(lockPath);
         tooOld = Date.now() - lstat.mtimeMs > CONFIG_LOCK_STALE_MS;
       } catch {}
-      if (holderDead && tooOld) {
+      const holderDead = holderPid !== null && !isAlive(holderPid);
+      const noPidStamp = holderPid === null;
+      // (b) fallback only kicks in when both conditions are clearly true
+      // simultaneously, so a brief race during stamp-write doesn't strip a
+      // valid live lock.
+      const orphanedByMissingPid = noPidStamp && tooOld;
+      if ((holderDead && tooOld) || orphanedByMissingPid) {
         if (tryReclaimStaleLock(lockPath)) continue;
       }
       sleepSync(CONFIG_LOCK_POLL_MS);

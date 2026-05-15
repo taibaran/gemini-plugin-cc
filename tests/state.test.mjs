@@ -313,6 +313,43 @@ test("withConfigLock: a fresh lock can be reclaimed only after the holder pid di
     `Dead holder's lock should be reclaimable. stderr=${deadHolderResult.stderr} stdout=${deadHolderResult.stdout}`);
 });
 
+test("withConfigLock: reclaims a 0-byte / malformed lock after the stale window", async () => {
+  // 0.5.8 regression guard. v0.5.7 introduced PID-stamped locks but parsed
+  // only "well-formed integer pid > 1". A process killed between
+  // `openSync("wx")` and `writeSync` leaves a 0-byte lock that, under the
+  // 0.5.7 rules, was permanently unrecoverable — strictly worse than the
+  // mtime-only behavior of 0.5.5. 0.5.8 restores the mtime fallback only
+  // when the PID stamp is missing/unparseable, so this scenario must
+  // recover.
+  const path = await import("node:path");
+  const dir = stateDir(process.cwd());
+  fs.mkdirSync(dir, { recursive: true });
+  const lockPath = path.join(dir, "config.json.lock");
+
+  // Empty lock file, aged mtime.
+  fs.writeFileSync(lockPath, "");
+  const oldTime = new Date(Date.now() - 10 * 60_000);  // 10 min ago > 30 s window
+  fs.utimesSync(lockPath, oldTime, oldTime);
+
+  const { spawnSync } = await import("node:child_process");
+  const url = await import("node:url");
+  const here = path.dirname(url.fileURLToPath(import.meta.url));
+  const acquireScript = `
+    process.env.CLAUDE_PLUGIN_DATA = ${JSON.stringify(process.env.CLAUDE_PLUGIN_DATA)};
+    import("${path.resolve(here, "../plugins/gemini/scripts/lib/state.mjs").replace(/\\/g, "/")}")
+      .then(m => m.setReviewGate(process.cwd(), true))
+      .then(() => process.exit(0))
+      .catch(() => process.exit(1));
+  `;
+  const r = spawnSync(process.execPath, ["-e", acquireScript], {
+    encoding: "utf8",
+    env: { ...process.env, CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA },
+    timeout: 7000
+  });
+  assert.equal(r.status, 0,
+    `Empty/malformed lock should be reclaimable after stale window. stderr=${r.stderr} stdout=${r.stdout}`);
+});
+
 test("runJob: silent-failure diagnostic fires on non-zero exit with empty buffers", async () => {
   // Issue #3 regression guard. Previously, a Gemini process that exited
   // non-zero without writing any stdout/stderr AND without matching

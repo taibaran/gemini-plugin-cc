@@ -26,19 +26,28 @@ export function isAlive(pid) {
 // after the SIGKILL escalation step — callers MUST await this before exiting,
 // otherwise the timer is cancelled by process.exit and SIGKILL never fires.
 //
-// Group-kill SIGKILL is unconditional: the previous version only sent SIGKILL
-// if `isAlive(pid)` was still true at the grace mark, which silently let
-// surviving descendants leak when the group leader died from SIGTERM but
-// children kept running. Now group SIGKILL always fires (ESRCH on an
-// already-empty group is harmless and swallowed).
+// Liveness checks intentionally do NOT gate the group kill: a dead leader
+// can still have surviving descendants in the same group. POSIX
+// `kill(-pid, sig)` routes to all live members regardless of leader state,
+// and ESRCH on an empty group is harmless. The previous "isAlive at top"
+// guard caused descendants to leak whenever the leader exited on SIGTERM
+// or was reaped before this function was called.
 export function terminateProcessTree(pid, { graceMs = 2000 } = {}) {
-  if (!isValidPid(pid) || !isAlive(pid)) return Promise.resolve();
+  if (!isValidPid(pid)) return Promise.resolve();
+  // Always attempt the group SIGTERM first — even if the leader is already
+  // dead, surviving group descendants need the signal. EPERM means the
+  // group exists under a different uid (still tracked as alive elsewhere).
+  // ESRCH means the group is empty; harmless.
   let groupKilled = false;
   try {
     process.kill(-pid, "SIGTERM");
     groupKilled = true;
   } catch {
-    try { process.kill(pid, "SIGTERM"); } catch {}
+    // Group kill failed — leader may not have been detached. Fall back to
+    // direct pid kill, only if the leader itself is still alive.
+    if (isAlive(pid)) {
+      try { process.kill(pid, "SIGTERM"); } catch {}
+    }
   }
   return new Promise(resolve => {
     setTimeout(() => {

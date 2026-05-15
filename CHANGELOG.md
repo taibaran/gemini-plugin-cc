@@ -1,5 +1,89 @@
 # Changelog
 
+## 0.5.8 — Robustness round 3: five findings from second `/grok:aggregate-review`
+
+Ran `/grok:aggregate-review` again, this time against the 0.5.6..0.5.7 diff
+with `--adversarial`. Codex, Gemini, and Grok independently surfaced five
+real issues, including two regressions introduced by 0.5.7 itself and one
+0.5.5/0.5.7 oversight that none of the prior rounds caught.
+
+### Fixes
+
+- **`config.json` lock no longer deadlocks on empty/malformed lock files**
+  (Codex + Gemini, two reviewers convergence).
+  v0.5.7 introduced PID-stamped locks but parsed only well-formed
+  `integer > 1`. A process killed between `openSync("wx")` and the
+  immediately-following `writeSync` left a 0-byte lock that
+  `readLockHolderPid` returned `null` for — `holderDead` then evaluated
+  to `false` forever, no reclaim path fired, and the 5 s acquire loop
+  timed out. **Strictly worse than v0.5.5's mtime-only logic**, which
+  would have unlinked after 30 s. v0.5.8 restores the mtime fallback,
+  but only when the PID stamp is missing/unparseable — well-formed live
+  locks remain protected, well-formed dead locks reclaim by pid, and
+  partially-written locks reclaim by age. New test in
+  `tests/state.test.mjs` exercises the 0-byte case.
+
+- **`runJob` (review / task / rescue) now awaits SIGKILL escalation**
+  (Codex).
+  v0.5.7 awaited the kill in `cmdAsk` and the stop-hook but missed the
+  parallel fix in `runJob`. So review / task / rescue would still drop
+  the inner 2 s SIGKILL when the leader closed on SIGTERM but
+  descendants survived. v0.5.8 stores the kill Promise in the timer
+  callback and awaits it in the close handler (now async) before
+  closing fds and writing status.
+
+- **`terminateProcessTree` no longer skips a still-needed group kill
+  when the leader is already dead** (Codex).
+  The top-of-function `if (!isAlive(pid)) return Promise.resolve()`
+  short-circuited the entire kill sequence — but a dead leader can
+  still have surviving descendants in the same process group. POSIX
+  `kill(-pid, sig)` routes to all live group members regardless of
+  leader liveness; ESRCH on an empty group is harmless. v0.5.8 attempts
+  the group SIGTERM unconditionally for any valid pid, and only falls
+  back to direct pid SIGTERM when the group kill itself fails.
+
+- **Rescue's 15 m default is now runtime-enforced, not prompt-only**
+  (Codex).
+  v0.5.7's "rescue must add `--timeout 15m`" rule was an instruction in
+  the agent + skill markdown. If the subagent forgot to add the flag
+  (LLM behavior, not a guarantee), `DEFAULT_TASK_TIMEOUT_MS = 0` made
+  the call unbounded again. v0.5.8 adds `GEMINI_RESCUE_MODE=1` as an
+  env var the rescue agent / skill set when spawning the Bash call.
+  When this env var is present, `DEFAULT_TASK_TIMEOUT_MS` resolves to
+  15 min at module load. Direct `/gemini:task` callers don't set the
+  var, so unbounded behavior is preserved for them. Belt-and-suspenders
+  with the prompt rule.
+
+- **`cmdAsk --timeout` user-facing message is now emitted synchronously
+  in the timer callback** (Gemini).
+  v0.5.7 wrote the *"ask timed out"* message inside the close handler,
+  which awaits the kill Promise. With a 2 s SIGKILL grace + however
+  long Gemini took to actually exit, the user could stare at a blank
+  terminal for several seconds past the deadline before seeing any
+  feedback. v0.5.8 emits the message synchronously the moment the
+  timer fires (parallel to the runJob pattern that writes
+  `meta.status = "timed-out"` synchronously), then awaits the kill in
+  close and exits 124. Restores the snappy ETIMEDOUT UX the
+  pre-v0.5.7 `spawnSync` path had.
+
+### Tests
+
+- 1 new test brings the suite to **98 total**:
+  - `withConfigLock: reclaims a 0-byte / malformed lock after the stale window`
+    — manually writes a 0-byte lock with backdated mtime and asserts a
+    fresh acquirer succeeds. Regression guard against v0.5.7's
+    pid-stamp-only stale check that left malformed locks permanently
+    stranded.
+
+### Not changed (deliberate)
+
+- Direct `/gemini:task` callers still get `DEFAULT_TASK_TIMEOUT_MS = 0`
+  (unbounded). The 15 m default only fires for rescue, where the
+  synchronous-by-contract subagent makes unbounded behavior dangerous.
+- The 5 s `CONFIG_LOCK_TIMEOUT_MS` is unchanged — the new fallback for
+  malformed locks unblocks the worst case, so most acquires complete in
+  microseconds and the 5 s cap is plenty.
+
 ## 0.5.7 — Robustness round 2: four findings from `/grok:aggregate-review`
 
 Ran the multi-LLM `/grok:aggregate-review` (Codex + Gemini + Grok in parallel)

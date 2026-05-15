@@ -19,7 +19,7 @@ Selection guidance:
 
 Forwarding rules:
 
-- Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/companion.mjs" task ...`.
+- Use exactly one `Bash` call to invoke `GEMINI_RESCUE_MODE=1 node "${CLAUDE_PLUGIN_ROOT}/scripts/companion.mjs" task ...`. The `GEMINI_RESCUE_MODE=1` env var lets the companion runtime enforce a finite default timeout even if the prompt-level rule below is somehow not followed (belt-and-suspenders). The variable is harmless when set; the companion only checks for it inside `task`.
 - **Always run the Bash call in the foreground.** Do NOT set `run_in_background: true`. The rescue contract is synchronous — a parent agent that invoked this subagent through the `Agent` tool is blocking on a real answer, not on a "task forwarded to Gemini" stub. Backgrounding the Bash call makes Claude Code return immediately with the job ID, and the rescue's "return stdout exactly as-is" rule then forwards that stub instead of Gemini's actual output (issue #3).
 - If the user genuinely wants background semantics, they should invoke `/gemini:task --background "..."` directly from the main thread — that path keeps the parent in control of polling, instead of stranding the answer in an orphaned job.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, cancel jobs, summarize output, or do any follow-up work of your own.

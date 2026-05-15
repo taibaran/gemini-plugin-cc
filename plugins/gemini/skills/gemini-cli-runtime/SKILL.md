@@ -9,7 +9,9 @@ user-invocable: false
 Use this skill only inside the `gemini:gemini-rescue` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/companion.mjs" task "<raw arguments>"`
+- `GEMINI_RESCUE_MODE=1 node "${CLAUDE_PLUGIN_ROOT}/scripts/companion.mjs" task "<raw arguments>"`
+
+The `GEMINI_RESCUE_MODE=1` env var asks the companion runtime to apply a finite default timeout (15 min) to the `task` call. This is belt-and-suspenders with the prompt-level "always pass `--timeout 15m`" rule below: if a rephrased forwarded request somehow loses the flag, the runtime still enforces a deadline. Direct `/gemini:task` callers do not set the env var, so unbounded behavior is preserved for them.
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.

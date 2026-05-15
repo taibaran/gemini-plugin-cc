@@ -31,7 +31,16 @@ import { renderJobTable, renderJobDetails, fmtTime, TerminalSanitizer, sanitizeF
 // by design and the user can always /gemini:cancel a stuck job.
 const DEFAULT_ASK_TIMEOUT_MS = 5 * 60 * 1000;       // 5 min
 const DEFAULT_REVIEW_TIMEOUT_MS = 20 * 60 * 1000;   // 20 min
-const DEFAULT_TASK_TIMEOUT_MS = 0;                  // unbounded
+// Task is normally unbounded — rescue work is open-ended by design. But the
+// rescue subagent runs synchronously and would strand the parent agent if
+// Gemini hangs. When GEMINI_RESCUE_MODE=1 is set in the env (the rescue
+// agent / skill set this when invoking the Bash call), we apply a 15-min
+// default. Belt-and-suspenders with the prompt-level rule in
+// agents/gemini-rescue.md — if the subagent forgets to pass --timeout the
+// runtime still enforces a deadline.
+const DEFAULT_TASK_TIMEOUT_MS = process.env.GEMINI_RESCUE_MODE === "1"
+  ? 15 * 60 * 1000  // 15 min
+  : 0;              // unbounded for direct /gemini:task callers
 
 // Node's setTimeout silently truncates delays exceeding 2^31-1 ms (~24.85d):
 // instead of waiting that long, the timer fires at ~1ms and Node prints a
@@ -245,6 +254,13 @@ async function cmdAsk({ flags, positional }) {
       timer = setTimeout(() => {
         if (proc.exitCode !== null || proc.signalCode !== null) return;
         timedOut = true;
+        // Emit the timeout message SYNCHRONOUSLY here, not in the close
+        // handler. The close handler may take up to 2s+graceMs because it
+        // awaits killPromise — leaving the user staring at a blank terminal
+        // for the full deadline + SIGKILL grace before any feedback.
+        // The old spawnSync({timeout}) path returned ETIMEDOUT immediately;
+        // matching that UX requires the user-facing message to fire now.
+        process.stderr.write(`\n[gemini-plugin] ask timed out after ${timeoutMs}ms. Re-run with --timeout 0 to disable, or pick a longer duration like --timeout 15m.\n`);
         killPromise = terminateProcessTree(proc.pid).catch(() => {});
       }, timeoutMs);
     }
@@ -259,7 +275,7 @@ async function cmdAsk({ flags, positional }) {
       if (tail) process.stdout.write(tail);
       if (timedOut) {
         if (errBuf) process.stderr.write(sanitizeForTerminal(errBuf));
-        process.stderr.write(`\n[gemini-plugin] ask timed out after ${timeoutMs}ms. Re-run with --timeout 0 to disable, or pick a longer duration like --timeout 15m.\n`);
+        // Message already emitted from the timer callback; just exit.
         resolve();
         process.exit(EXIT_TIMEOUT);
       }
@@ -325,6 +341,11 @@ function runJob({ args, meta, stdin = null, showStdout = true, timeoutMs = 0 }) 
 
     let timedOut = false;
     let timeoutTimer = null;
+    // Hold the kill Promise so the close handler can await it before
+    // exiting. Without this, process.exit cancels the pending SIGKILL
+    // timer inside terminateProcessTree and SIGTERM-ignoring descendants
+    // survive past the supposed cleanup. Same pattern stop-hook uses.
+    let killPromise = null;
     if (timeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
         // The process may have exited cleanly between when the timer was
@@ -341,7 +362,7 @@ function runJob({ args, meta, stdin = null, showStdout = true, timeoutMs = 0 }) 
         meta.status = "timed-out";
         meta.ended_at = new Date().toISOString();
         try { writeJobMeta(meta.id, meta); } catch {}
-        terminateProcessTree(proc.pid).catch(() => {});
+        killPromise = terminateProcessTree(proc.pid).catch(() => {});
       }, timeoutMs);
     }
 
@@ -362,8 +383,12 @@ function runJob({ args, meta, stdin = null, showStdout = true, timeoutMs = 0 }) 
       }
     });
 
-    proc.on("close", code => {
+    proc.on("close", async code => {
       if (timeoutTimer) clearTimeout(timeoutTimer);
+      // Await SIGKILL escalation BEFORE closing fds / emitting status so
+      // that any descendants the leader spawned get fully cleaned up.
+      // Same async-close pattern stop-hook and cmdAsk use.
+      if (killPromise) await killPromise;
       try { fs.closeSync(stdoutFd); } catch {}
       try { fs.closeSync(stderrFd); } catch {}
       if (showStdout) {
