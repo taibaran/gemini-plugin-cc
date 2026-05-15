@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.5.14 — Two findings from `/grok:aggregate-review` against the v0.5.13 fix
+
+Ran `/grok:aggregate-review` (Codex + Gemini + Grok in parallel) against
+the full v0.5.5..v0.5.13 robustness arc. Two real bugs surfaced that
+seven prior single-reviewer rounds missed — both in `lib/git.mjs`, both
+in the same area as issue #4 but different causes.
+
+### Fix 1: branch diff failures are no longer silent (3/3 reviewer consensus)
+
+The v0.5.13 fix closed the *"-- separator misparsed as pathspec"* failure
+mode, but the same false-negative *"Nothing to review"* still appeared
+for any **other** `git diff <ref>...HEAD` failure: shallow clones (no
+merge base), unrelated histories (`--orphan`), ambiguous refs not on
+the remote, etc. The old code collapsed all of those to
+`{ kind: "branch", diff: "" }` and `cmdReview` printed *"Nothing to
+review"* with exit 0 — identical to a legitimately empty branch.
+
+When both `git diff <ref>...HEAD --` and the no-`--` fallback return
+non-zero status, `captureDiff` now returns
+`{ kind: "diff-failed", diff: "", base, error: <git stderr> }`.
+`cmdReview` treats this like `bad-ref`/`no-base`: prints the actual
+git error plus a hint about common causes (shallow, unrelated histories,
+base not on remote) and exits 2.
+
+### Fix 2: `spawnSync` 1 MB default `maxBuffer` silently truncated diffs (Codex)
+
+Node's `spawnSync` defaults to a 1 MB stdout buffer. Without an explicit
+`maxBuffer`, any `git diff` between 1 MB and `MAX_DIFF_BYTES = 4 MB`
+returned `ENOBUFS` with stdout truncated at ~1 MB — and the plugin's
+own `truncateDiff` (which adds a visible `[... diff truncated ...]`
+marker) never ran. All five git-diff spawnSync sites in `captureDiff`
+(branch primary + fallback, staged, unstaged, auto/working-tree) now
+set `maxBuffer = MAX_DIFF_BYTES + 64 KB` so truncation decisions belong
+to `truncateDiff`, never to Node's silent default.
+
+### Tests
+
+- 1 new regression test (100 total): orphan-branch repo where
+  `git diff main...HEAD` returns `fatal: no merge base`. Asserts
+  `kind === "diff-failed"` and `error` matches "no merge base".
+  Would have caught both issue #4 and this v0.5.14 finding under the
+  pre-v0.5.13 code.
+
+### Notes for downstream wrappers
+
+Same code shape exists in `taibaran/grok-plugin-cc` and likely
+`openai/codex-plugin-cc`. Both findings should apply there too.
+
 ## 0.5.13 — Fix issue #4: `--scope branch` silently returned empty diff
 
 A bug report (issue #4) flagged that `/gemini:review --base <ref> --scope
