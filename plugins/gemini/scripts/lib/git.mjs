@@ -47,11 +47,16 @@ export function captureDiff({ scope, base, cwd } = {}) {
     // it apart from a clean branch.
     const verify = spawnSync("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], { encoding: "utf8", cwd });
     if (verify.status !== 0) return { kind: "bad-ref", diff: "", base: ref };
-    // `--` separates options from refspecs so a ref that somehow slipped past
-    // our regex still can't be parsed as an option.
-    const r = spawnSync("git", ["diff", "--", `${ref}...HEAD`], { encoding: "utf8", cwd });
-    // Some versions of git diff don't accept `--` before a refspec. Fall back
-    // to plain form if the validated ref-only form failed.
+    // `--` separates options from PATHSPECS, not refspecs. Issue #4: the
+    // previous form `git diff -- <ref>...HEAD` made git treat the refspec
+    // as a path named "<ref>...HEAD", which matched nothing → empty diff
+    // with exit 0 (so the fallback below never fired). The refspec must
+    // come BEFORE `--`. The trailing `--` still terminates option parsing
+    // for any future arg the caller might add, preserving the defense
+    // intent of the original code.
+    const r = spawnSync("git", ["diff", `${ref}...HEAD`, "--"], { encoding: "utf8", cwd });
+    // Older git versions (<2.5) may not accept the trailing `--` after a
+    // refspec form `A...B`. Fall back to the plain refspec form.
     const out = r.status === 0
       ? (r.stdout || "")
       : (spawnSync("git", ["diff", `${ref}...HEAD`], { encoding: "utf8", cwd }).stdout || "");
